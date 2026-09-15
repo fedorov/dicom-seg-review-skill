@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.DS_Store
+
+# review outputs - the CSVs belong in the repo of the batch being reviewed,
+# not in the skill
+findings/
+seg_attributes.csv
+codes.csv
