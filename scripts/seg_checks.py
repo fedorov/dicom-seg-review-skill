@@ -291,8 +291,8 @@ def tracking_uid(rows):
         seed = any("SEED POINT" in (r["SeriesDescription"] or "").upper() for r in group)
 
         if len(patients) > 1:
-            # Never seen in the batches this came from, and a serious problem if
-            # it appears: one identifier spanning two people.
+            # Normally absent, and a serious problem if it appears: one
+            # identifier spanning two people.
             pattern = "CROSS_PATIENT"
         elif len(studies) > 1:
             pattern = "LONGITUDINAL"      # the intended use

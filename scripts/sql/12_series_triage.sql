@@ -78,8 +78,8 @@ WITH
       AND LOGICAL_AND(UPPER(SeriesDescription) NOT LIKE '%SEED POINT%')
   ),
 
-  # Issue 7, the serious case: one identifier spanning two patients. Absent from
-  # both batches this was built against, and a real problem if it appears.
+  # Issue 7, the serious case: one identifier spanning two patients. Normally
+  # absent, and a real problem if it appears.
   crossPatientTrackingUIDs AS (
     SELECT TrackingUID
     FROM `@@SEG_ATTRIBUTES@@`

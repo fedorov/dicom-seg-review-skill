@@ -17,9 +17,10 @@
 #
 # THIS WILL NOT FOLLOW A NEW DELIVERY. It encodes judgements about the codes one
 # batch happened to use. Re-derive it by running 02_ambiguous_code.sql and
-# 03_codes_not_in_dcmterm.sql against the new data, resolving every code with
-# scripts/lookup_codes.py, and re-checking what they surface. Until that is
-# done the verdicts are stale and the report must say so.
+# 03_codes_not_in_dcmterm.sql (or scripts/dcmterm.py coverage) against the new
+# data, resolving every code with scripts/lookup_codes.py, and re-checking what
+# they surface. Until that is done the verdicts are stale and the report must
+# say so.
 #
 # `verdict` values:
 #   WRONG_ANATOMY        the code names materially different anatomy. An error.
@@ -36,9 +37,8 @@
 # section numbering of the report.
 
 SELECT * FROM UNNEST([
-    # Replace these two examples with the batch's own verdicts. They are real
-    # findings from the batch this skill was built from, kept only to show the
-    # shape - DELETE THEM before deploying against your data.
+    # Replace these two examples with the batch's own verdicts. They are here
+    # only to show the shape - DELETE THEM before deploying against your data.
     STRUCT(
       1 AS issue,
       'SCT' AS CodingSchemeDesignator,
@@ -46,6 +46,8 @@ SELECT * FROM UNNEST([
       'liver' AS codeActuallyMeans,
       'Large bowel' AS meaningRecorded,
       'WRONG_ANATOMY' AS verdict,
+      # 'dcmterm' means the code set DICOM's own context groups use - see
+      # scripts/dcmterm.py, which prints the edition it checked against.
       'dcmterm' AS reviewSource),
     (3, 'SCT', '110634007', 'right uterine adnexa', 'Left adnexa',
      'INVERTED', 'tx.fhir.org')])

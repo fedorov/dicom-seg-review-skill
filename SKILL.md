@@ -3,7 +3,7 @@ name: dicom-seg-review
 description: Review a delivery of DICOM Segmentation (SEG) objects for metadata defects — anatomic codes that contradict their own CodeMeaning, one code used with conflicting meanings, inverted or uncoded laterality, non-conformant segments, ambiguous TrackingUIDs, wrong SNOMED code flavour — and produce a severity-ranked report plus a per-series triage list. Use when asked to audit, QC, review or sanity-check DICOM segmentations or their anatomic/SNOMED coding, whether the metadata is reachable through BigQuery, a DICOMweb store, or local DICOM files.
 license: Apache-2.0
 metadata:
-  version: 1.0.0
+  version: 1.1.0
   skill-author: Andrey Fedorov, @fedorov
 ---
 
@@ -16,10 +16,6 @@ defects that make a segmentation delivery unusable downstream: a segment that sa
 "Large bowel" while its code denotes the liver, one code carrying five different
 meanings, a left structure coded as the right one, a segment missing Type 1
 attributes.
-
-Distilled from two applied reviews: a 1,316-object / 1,961-segment manual annotation
-delivery, and a 3,439-object / 51,584-segment AI-generated store. Every check here
-caught something real in at least one of them.
 
 **Two deliverables**, both described in `references/reporting.md`:
 1. A severity-ranked issue report — what is wrong, how much of the batch, worked
@@ -52,7 +48,7 @@ that. Pick by what access you have:
 
 | You have | Read | Cost |
 |---|---|---|
-| A BigQuery metadata table (Healthcare API export, or `idc_current.dicom_all`) | `references/access-bigquery.md` | Best for whole-archive scale; the proven path |
+| A BigQuery metadata table (Healthcare API export, or `idc_current.dicom_all`) | `references/access-bigquery.md` | Best for whole-archive scale |
 | A DICOMweb endpoint (Healthcare API store, IDC proxy) | `references/access-dicomweb.md` | One metadata request per series; no BigQuery needed |
 | A directory of `.dcm` files | `references/access-local-files.md` | Fully offline; `pydicom` only |
 
@@ -76,10 +72,15 @@ data never had a problem with.
 
 3. **Run the computed checks**, in this order:
    - **Ambiguous codes first** (`sql/02_ambiguous_code.sql`, or `seg_checks.py`). One
-     code used with more than one `CodeMeaning` is fully computed and needs no
-     curation, and it is the single highest-yield check — it found 46% of segments in
-     one batch. It also hands you the shortlist for step 4.
-   - Coverage gap, conformance, type-repeats-category, SegmentsOverlap, TrackingUID.
+     code used with more than one `CodeMeaning` is fully computed, needs no curation,
+     and is typically the highest-yield check in the set. It also hands you the
+     shortlist for step 4.
+   - **Against DICOM's own code set** (`scripts/dcmterm.py coverage`). Which codes
+     DICOM's context groups use, and whether it uses them for what the batch says.
+     Public Parquet from [dcmterms](https://github.com/fedorov/dcmterms), cached
+     locally — no BigQuery, no credentials. Produces both the coverage-gap deliverable
+     and a computed shortlist of meaning disagreements.
+   - Conformance, type-repeats-category, SegmentsOverlap, TrackingUID.
 
 4. **Look up every distinct anatomic code's fully specified name** —
    `scripts/lookup_codes.py`. This is what turns "these codes are suspicious" into
@@ -108,9 +109,8 @@ Full detail, DICOM references and detection logic in `references/issue-catalogue
 | 5 | Low | `SegmentedPropertyType` merely repeats the category | Computed |
 | 6 | Low | `SegmentsOverlap` absent (Type 3 — conformant, but costly on multi-segment objects) | Computed |
 
-Numbering is by discovery order and is kept stable so reports cross-reference; the
-table is in severity order. Add new issues with the next free number rather than
-renumbering.
+Numbering is stable so reports cross-reference; the table is in severity order. Add
+new issues with the next free number rather than renumbering.
 
 **Anatomic coding is almost always where the damage is.** Issues 1, 2, 3 and 8 are
 all about it. Budget the review accordingly.
@@ -130,21 +130,22 @@ State the scale separately from the severity, and never let scale promote a find
 These each cost real time to learn. Read `references/issue-catalogue.md` before
 concluding anything about a batch.
 
-- **The coverage trap.** A terminology table built from DICOM's context groups (e.g.
-  `dcmterm`) covers only the codes DICOM itself uses — 57 of 134 codes in one batch.
-  A check that joins it and reports the misses as clean **silently passes everything
-  it does not cover**, and the single worst error in that batch was in the gap. Always
-  publish the uncovered-code list as a deliverable of its own, and check those against
-  a terminology server.
+- **The coverage trap.** A terminology table built from DICOM's context groups
+  (`dcmterms`) covers only the codes DICOM itself uses, which can be well under half
+  the codes in a batch. A check that joins it and reports the misses as clean
+  **silently passes everything it does not cover**. Measure the gap on your own batch
+  — `dcmterm.py coverage` prints how many codes and segments it reached — then publish
+  the uncovered-code list as a deliverable of its own and check those against a
+  terminology server.
 
 - **Neither field is trustworthy.** Where `CodeValue` and `CodeMeaning` disagree,
   sometimes the code is wrong and sometimes the meaning is. A consumer that
   systematically trusts either one gets some segments wrong. Report both, say which
   is wrong per case, and do not "normalise" your way out of it.
 
-- **`SegmentLabel` is usually not independent evidence.** In one batch it was the
-  `CodeMeaning` plus an enumerator in 91% of segments. It is a tiebreaker only in the
-  minority where it differs.
+- **`SegmentLabel` is usually not independent evidence.** It is commonly the
+  `CodeMeaning` plus an enumerator. Measure how often the two differ before leaning on
+  it; it is a tiebreaker only in the minority where it does.
 
 - **Ambiguity is a property of a code, not of a segment.** Most series using an
   ambiguous code use it with its dominant, correct meaning. Tag them
@@ -173,8 +174,9 @@ concluding anything about a batch.
 
 ## Scripts
 
-Run from the skill root. `seg_checks.py` is stdlib-only; the extractors need
-`pydicom` or `dicomweb-client` respectively.
+Run from the skill root. `seg_checks.py` and `lookup_codes.py` are stdlib-only; the
+extractors need `pydicom` or `dicomweb-client`, and `dcmterm.py` needs any one of
+`pyarrow`, `duckdb` or `pandas` to read Parquet.
 
 ```bash
 # 1. Extract the per-segment table (pick one source)
@@ -185,10 +187,14 @@ python scripts/seg_attributes.py --dicomweb <base-url> --gcp   -o seg_attributes
 # 2. Computed checks + per-series triage
 python scripts/seg_checks.py seg_attributes.csv --outdir findings/
 
-# 3. Fully specified names for every anatomic code, and "Entire X" detection
-python scripts/lookup_codes.py seg_attributes.csv -o findings/codes.csv
+# 3. Against DICOM's own code set: coverage gap + meaning disagreements
+python scripts/dcmterm.py coverage seg_attributes.csv -o findings/coverage.csv
 
-# 4. Re-run the checks with the FSNs and your curated verdicts folded in
+# 4. Fully specified names for every anatomic code, and "Entire X" detection
+python scripts/lookup_codes.py seg_attributes.csv -o findings/codes.csv
+python scripts/dcmterm.py suggest findings/codes.csv -o findings/entire_flavour.csv
+
+# 5. Re-run the checks with the FSNs and your curated verdicts folded in
 python scripts/seg_checks.py seg_attributes.csv \
     --codes findings/codes.csv --review review.csv --outdir findings/
 ```

@@ -13,8 +13,8 @@ Usage:
   python lookup_codes.py seg_attributes.csv --column SegmentedPropertyTypeCodeValue
 
 Output is one row per distinct (CodingSchemeDesignator, CodeValue), sorted by
-how many segments depend on it. Work down from the top: in both batches this
-came from, a handful of codes accounted for most of the damage.
+how many segments depend on it. Work down from the top - a handful of codes
+usually accounts for most of the damage.
 
 Only SCT codes are looked up. Private designators (99XXXX) and DCM codes cannot
 be resolved here and are reported as skipped - judge them against whatever

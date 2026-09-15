@@ -8,10 +8,6 @@ labelled "Large bowel" whose code denotes the liver, one code carrying five diff
 meanings, a left structure coded as the right one, a segment missing attributes DICOM
 makes Type 1.
 
-Distilled from two applied reviews — a 1,316-object manual annotation delivery and a
-3,439-object AI-generated store — and every check in it caught something real in at
-least one of them.
-
 ## Install
 
 ```bash
@@ -55,10 +51,11 @@ references/
 scripts/
   seg_attributes.py                  extract the per-segment table (files | DICOMweb)
   seg_checks.py                      run the computed checks + triage roll-up
+  dcmterm.py                         check codes against the code set DICOM uses
   lookup_codes.py                    resolve codes to fully specified names
   sql/                               the same checks as BigQuery templates, 01–12
 tests/
-  test_seg_review.py                 30 tests over the extraction and check logic
+  test_seg_review.py                 43 tests over the extraction and check logic
 ```
 
 ## Usage
@@ -71,10 +68,14 @@ python scripts/seg_attributes.py --dicomweb <url-or-store> --gcp -o seg_attribut
 # 2. Computed checks + per-series triage
 python scripts/seg_checks.py seg_attributes.csv --outdir findings/
 
-# 3. Fully specified names for every anatomic code, and "Entire X" detection
-python scripts/lookup_codes.py seg_attributes.csv -o findings/codes.csv
+# 3. Coverage gap + meaning disagreements against DICOM's own code set
+python scripts/dcmterm.py coverage seg_attributes.csv -o findings/coverage.csv
 
-# 4. Re-run with the curated verdicts folded in
+# 4. Fully specified names for every anatomic code, and "Entire X" detection
+python scripts/lookup_codes.py seg_attributes.csv -o findings/codes.csv
+python scripts/dcmterm.py suggest findings/codes.csv -o findings/entire_flavour.csv
+
+# 5. Re-run with the curated verdicts folded in
 python scripts/seg_checks.py seg_attributes.csv --codes findings/codes.csv \
     --review review.csv --outdir findings/
 ```
@@ -87,20 +88,35 @@ against it. See `references/access-bigquery.md`.
 | | |
 |---|---|
 | `seg_checks.py`, `lookup_codes.py` | standard library only |
+| `dcmterm.py` | any one of `pyarrow`, `duckdb` or `pandas`, to read Parquet |
 | `seg_attributes.py --files` | `pydicom>=3.0` |
 | `seg_attributes.py --dicomweb` | `dicomweb-client>=0.59`, plus `[gcp]` and `google-auth` for Healthcare API stores |
 | `scripts/sql/` | the `bq` CLI |
 | `lookup_codes.py` | network access to `tx.fhir.org` (public, no auth) |
+| `dcmterm.py` | one download from [fedorov/dcmterms](https://github.com/fedorov/dcmterms) (public, ~0.5 MB, cached) |
+
+## Terminology sources
+
+Both are public and need no credentials:
+
+| | |
+|---|---|
+| [**dcmterms**](https://github.com/fedorov/dcmterms) | every coded entry in DICOM PS3.16's context groups, as Parquet — what DICOM *expects*, and the evidence behind the "Entire X" finding |
+| [**tx.fhir.org**](https://tx.fhir.org) | all of SNOMED CT — fully specified names, retired concepts, everything dcmterms does not cover |
+
+Neither one alone is enough, and a review that joins only the first **silently passes
+everything it does not cover**, which can be most of a batch. See "The coverage trap"
+in `SKILL.md`.
 
 ## Verification
 
-`python tests/test_seg_review.py` — 30 tests covering extraction (Background segments,
-multi-valued code sequences, both laterality modifier sequences, absent attributes) and
+`python tests/test_seg_review.py` — 43 tests covering extraction (Background segments,
+multi-valued code sequences, both laterality modifier sequences, absent attributes),
 the check logic (ambiguity scope classification, Type 1 conformance, TrackingUID
-sharing patterns, triage severity and ordering).
-
-The BigQuery templates were dry-run against two real stores of different shape, and the
-scripts against real SEG objects from both a manual and a dcmqi-produced delivery.
+sharing patterns, triage severity and ordering) and the terminology comparison
+(meaning agreement, the private-scheme and coverage-gap split, "Entire X" replacement
+matching). The terminology tests run against a stub table, so the suite needs no
+network.
 
 ## Scope
 

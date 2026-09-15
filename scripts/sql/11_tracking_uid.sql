@@ -10,8 +10,8 @@
 #
 # `sharingPattern` is the column to work from:
 #   CROSS_PATIENT     one identifier spanning two people. A serious problem, and
-#                     absent from both batches this was built against.
-#   WITHIN_SERIES     repeated inside a single series. Also absent from both.
+#                     normally absent - report the negative when it is.
+#   WITHIN_SERIES     repeated inside a single series. Also normally absent.
 #   WITHIN_STUDY      two segmentation series of one study; UNCLEAR whether that
 #                     is one finding annotated twice or a reused UID. These are
 #                     the ones to escalate.

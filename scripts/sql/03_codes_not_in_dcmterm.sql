@@ -7,20 +7,32 @@
 # One row per (CodingSchemeDesignator, CodeValue). Fully computed.
 #
 # THIS IS A DELIVERABLE, not a diagnostic. A DICOM-derived table holds codes
-# used by DICOM's context groups, not all of SNOMED: in one batch it covered
-# 57 of 134 anatomic codes - 880 of 1,961 segments. A check that joins it and
-# treats non-matches as clean therefore passes more than half the batch without
-# looking, and the single worst error in that batch was in the gap.
+# used by DICOM's context groups, not all of SNOMED, and the share of a batch it
+# reaches can be well under half. A check that joins it and treats non-matches
+# as clean therefore passes everything in the gap without looking - and the most
+# serious error in a batch can be sitting in exactly that gap.
 #
 # So: publish this list with the report, say the clean bill does not extend to
 # it, and check every code here against a terminology server -
 # tx.fhir.org/r4/CodeSystem/$lookup?system=http://snomed.info/sct&code=<CODE>
 # which is what scripts/lookup_codes.py automates.
 #
-# @@DCMTERM_TABLE@@ is a table of (coding_scheme_designator, code_value) pairs
-# extracted from the DICOM standard's context groups - e.g.
-# idc-sandbox-000.dcmterm.codes_unique. Skip this query if you have none; run
-# lookup_codes.py over every code instead.
+# @@DCMTERM_TABLE@@ is the code set extracted from the DICOM standard's context
+# groups. Load it from the public Parquet published by fedorov/dcmterms - no
+# private table needed:
+#
+#   curl -LO https://raw.githubusercontent.com/fedorov/dcmterms/main/docs/data/codes_unique.parquet
+#   bq load --project_id=<project> --source_format=PARQUET \
+#     <dataset>.dcmterm_codes_unique codes_unique.parquet
+#
+# NOTE it is deduplicated on the MEANING as well as the code - 21974007 is in it
+# as both "Tongue" and "tongue" - so the join below takes DISTINCT pairs. Joining
+# it raw multiplies rows.
+#
+# scripts/dcmterm.py runs this same check with no BigQuery at all, reads the
+# Parquet directly, and additionally reports codes that ARE in the set but carry
+# a meaning DICOM does not use for them. Prefer it unless the batch is only
+# reachable through BigQuery.
 
 SELECT
   # description:

@@ -14,7 +14,7 @@ A single Markdown document. Structure that worked:
 
 ## Severity scale        <- define it before using it
 ## Summary               <- table, severity order, with a query per row
-## <one section per issue, numbered by discovery>
+## <one section per issue, by issue number>
 ## Suggested follow-up   <- ordered by severity, each item actionable
 ## Per-series triage list
 ## Reproducing
@@ -22,9 +22,9 @@ A single Markdown document. Structure that worked:
 
 ### Open with what was reviewed, not with findings
 
-> Written 2026-09-02, against the SEG population of `<table>`: **1,316 SEG objects,
-> 1,961 segments**, all produced by highdicom 0.22.0, all `BINARY`, all
-> `SegmentAlgorithmType = MANUAL`.
+> Written <date>, against the SEG population of `<table>`: **<n> SEG objects, <n>
+> segments**, all produced by <toolkit> <version>, all `<SegmentationType>`, all
+> `SegmentAlgorithmType = <type>`.
 
 Someone who has never seen the data can read the rest after that sentence. Give the
 producer, the segmentation type, the algorithm type, and the counts of objects,
@@ -37,9 +37,9 @@ a problem.
 | # | Severity | Problem | Scale | Query |
 |---|---|---|---|---|
 
-Sections numbered by discovery, table sorted by severity, and say so, or a reader
-will assume the numbering is meaningful. Follow the table with **one sentence naming
-the real problem** — in both batches it was "the anatomic region coding is the problem;
+Sections by issue number, table sorted by severity, and say so, or a reader will
+assume the numbering is meaningful. Follow the table with **one sentence naming the
+real problem** — usually some form of "the anatomic region coding is the problem;
 issues 1, 2, 3 and 8 are all about it, and nothing else here is more than a nuisance".
 That sentence is what a busy reader takes away.
 
@@ -74,8 +74,18 @@ The exact commands, and — importantly — **which parts will not follow a new 
 
 > The review view will **not** follow a new delivery: it encodes judgements about
 > specific codes. Re-derive it by running `02_ambiguous_code.sql` and
-> `03_codes_not_in_dcmterm.sql` against the new data and re-checking what they surface.
-> Every other query is fully computed and will follow the data.
+> `dcmterm.py coverage` (or `03_codes_not_in_dcmterm.sql`) against the new data and
+> re-checking what they surface. Every other query is fully computed and will follow
+> the data.
+
+**Name the two terminology sources by version**, in the same section:
+
+> Codes were checked against DICOM 2026c (dcmterms, extracted 2026-07-02) and, for
+> those DICOM does not carry, against SNOMED CT via `tx.fhir.org` on 2026-09-15.
+
+Both move. "This code is not in DICOM's code set" and "this code is retired" are claims
+about a particular edition on a particular day, and a reader re-running the review a
+year later needs to know which one you saw. `dcmterm.py` prints the line to copy.
 
 Without that paragraph the next person runs the whole set against a new batch and
 trusts stale verdicts.
@@ -95,8 +105,8 @@ One row per SEG series, sorted worst-first, CSV in version control.
 | `SeriesDescription`, `viewer_url` | |
 
 Sort by `worstSeverity`, then `segmentsNeedingRecode` descending. The series needing
-most work are then the first rows, which is the only property that makes a
-1,316-row CSV usable.
+most work are then the first rows, which is the only property that makes a CSV of a
+few thousand rows usable.
 
 Tags, each traceable to one issue query:
 
@@ -126,18 +136,18 @@ count as final.
 ### `CODE_AMBIGUOUS_ELSEWHERE` is not a work queue
 
 Issue 2 is a statement about *codes* measured across the whole population, so attaching
-it to a series needs care. Of 599 series using a code that is ambiguous somewhere in
-the manual batch:
+it to a series needs care. Split the series touching an ambiguous code three ways:
 
-- **8** used one code two ways inside themselves — `CODE_SELF_INCONSISTENT`
-- **102** used a code's minority reading — `CODE_MEANING_MINORITY`
-- **497** used only dominant meanings and were unremarkable, implicated solely because
-  some other series, often a different patient, used the same code differently
+- those using one code two ways inside themselves — `CODE_SELF_INCONSISTENT`
+- those using a code's minority reading — `CODE_MEANING_MINORITY`
+- those using only dominant meanings, unremarkable in themselves, implicated solely
+  because some other series, often a different patient, used the same code differently
 
 Only the first two are evidence about the series, and only they raise `worstSeverity`.
-Let the third raise it and 45% of the batch lands in the work queue for no reason.
+The third group is normally much the largest; let it raise severity and a large part
+of the batch lands in the work queue for no reason.
 
-Report the breakdown by worst severity — "170 High, 216 Medium, 514 Low, 416 series
+Report the breakdown by worst severity — "<n> High, <n> Medium, <n> Low, <n> series
 with no issue" — so the size of the job is legible.
 
 ### Reconcile the counts
@@ -145,8 +155,8 @@ with no issue" — so the size of the job is legible.
 The triage list and the report are generated separately and will disagree if a tag is
 defined differently in each. Check the arithmetic and explain it where it looks wrong:
 
-> That 119 is 118 `ANATOMY_CONFLICT` series plus the one `LATERALITY_INVERTED` series,
-> which carries no anatomy conflict of its own — the two tags do not overlap.
+> That total is the `ANATOMY_CONFLICT` series plus the one `LATERALITY_INVERTED`
+> series, which carries no anatomy conflict of its own — the two tags do not overlap.
 
 A count in a report that a reader cannot reproduce from the CSV costs more trust than
 the finding gains.

@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 from pydicom.dataset import Dataset  # noqa: E402
 
+import dcmterm  # noqa: E402
 import seg_attributes  # noqa: E402
 import seg_checks  # noqa: E402
 
@@ -182,10 +183,10 @@ class TestAmbiguousCodes(unittest.TestCase):
 
 
 class TestCosmeticHeuristic(unittest.TestCase):
-    """Separating cosmetic variants from genuine granularity differences, on the
-    real CodeMeaning pairs the source batch contained. Getting this wrong in
-    either direction matters: a missed variant inflates the work queue, and a
-    NARROWER_OR_BROADER wrongly called cosmetic is a Medium finding filed as Low."""
+    """Separating cosmetic variants from genuine granularity differences. Getting
+    this wrong in either direction matters: a missed variant inflates the work
+    queue, and a NARROWER_OR_BROADER wrongly called cosmetic is a Medium finding
+    filed as Low."""
 
     SAME = [
         ("Left adrenal gland", "Left adrenal"),
@@ -279,7 +280,7 @@ class TestTrackingUid(unittest.TestCase):
         self.assertEqual(patterns["U1"], "SEED_AND_LESION")
 
     def test_cross_patient_outranks_everything(self):
-        """Never seen in the batches this came from, and serious if it appears."""
+        """Normally absent, and serious if it appears."""
         patterns = self._pattern([
             instance([segment(1, "A", tracking_uid="U1")], patient="P1", study="ST1"),
             instance([segment(1, "A", tracking_uid="U1")], sop="1.2", patient="P2",
@@ -364,6 +365,137 @@ class TestOtherChecks(unittest.TestCase):
     def test_present_segments_overlap_is_not_reported(self):
         rows = rows_for([instance([segment(1, "A")], overlap="NO")])
         self.assertEqual(seg_checks.segments_overlap_absent(rows), [])
+
+
+def reference(*entries):
+    """A stand-in for codes_unique, so the tests never touch the network.
+
+    Same shape dcmterm.dcm_codes builds: one entry per code, every meaning DICOM
+    spells it with, and the number of context groups using it.
+    """
+    table = {}
+    for scheme, value, meanings, num_cids in entries:
+        table[(scheme, value)] = {
+            "meanings": list(meanings),
+            "normalised": {dcmterm.normalise(m) for m in meanings},
+            "numCids": num_cids,
+        }
+    return table
+
+
+DCM = reference(
+    ("SCT", "10200004", ["Liver"], 9),
+    ("SCT", "21974007", ["Tongue", "tongue"], 4),
+    ("SCT", "71854001", ["Colon"], 4),
+    ("SCT", "78961009", ["Spleen"], 6),
+    ("SCT", "60184004", ["Sigmoid colon"], 2),
+)
+
+
+def batch(*entries):
+    return {(scheme, value): {"meanings": set(meanings), "segments": segments,
+                              "series": {"s1"}}
+            for scheme, value, meanings, segments in entries}
+
+
+class TestDcmtermCoverage(unittest.TestCase):
+    """The computed half of the terminology check: what DICOM itself uses."""
+
+    def row_for(self, *entries):
+        return {r["CodeValue"]: r for r in dcmterm.coverage(batch(*entries), DCM)}
+
+    def test_meaning_dicom_does_not_use_is_flagged(self):
+        """The finding this exists for: 10200004 is DICOM's liver code, and the
+        batch calls it large bowel."""
+        row = self.row_for(("SCT", "10200004", ["Large bowel"], 3))["10200004"]
+        self.assertEqual(row["inDcmterm"], "True")
+        self.assertEqual(row["meaningAgrees"], "False")
+        self.assertEqual(row["dcmMeanings"], "Liver")
+        self.assertEqual(row["numCids"], 9)
+
+    def test_matching_meaning_agrees_regardless_of_case(self):
+        row = self.row_for(("SCT", "21974007", ["tongue"], 1))["21974007"]
+        self.assertEqual(row["meaningAgrees"], "True")
+
+    def test_one_of_two_meanings_matching_is_partial(self):
+        """A code carrying two meanings, only one of which DICOM uses, is neither
+        agreement nor disagreement - reporting it as either loses the finding."""
+        row = self.row_for(("SCT", "71854001", ["Colon", "Sigmoid"], 2))["71854001"]
+        self.assertEqual(row["meaningAgrees"], "PARTIAL")
+
+    def test_hyphenation_is_not_normalised_away(self):
+        """"Paraaortic" against "para-aortic" is the SPELLING verdict, a finding."""
+        self.assertNotEqual(dcmterm.normalise("para-aortic"),
+                            dcmterm.normalise("paraaortic"))
+
+    def test_uncovered_code_reports_no_verdict(self):
+        """Absence from DICOM's code set is not a clean bill and not a fault:
+        the meaning columns stay empty so nothing downstream reads agreement."""
+        row = self.row_for(("SCT", "110634007", ["Left adnexa"], 1))["110634007"]
+        self.assertEqual(row["inDcmterm"], "False")
+        self.assertEqual(row["meaningAgrees"], "")
+        self.assertEqual(row["dcmMeanings"], "")
+
+    def test_private_scheme_is_separated_from_the_gap(self):
+        """A 99 designator is an expected miss, not an unreviewed code."""
+        row = self.row_for(("99LOCAL", "WIDGET", ["Widget"], 5))["WIDGET"]
+        self.assertEqual(row["isPrivateScheme"], "True")
+        self.assertEqual(row["inDcmterm"], "False")
+
+    def test_rows_are_ordered_by_segments_affected(self):
+        rows = dcmterm.coverage(batch(("SCT", "78961009", ["Spleen"], 2),
+                                      ("SCT", "10200004", ["Liver"], 40)), DCM)
+        self.assertEqual(rows[0]["CodeValue"], "10200004")
+
+    def test_background_segments_are_excluded(self):
+        table = Path(__file__).resolve().parent / "_batch.csv"
+        table.write_text(
+            "SeriesInstanceUID,isBackgroundSegment,AnatomicRegionCodingSchemeDesignator,"
+            "AnatomicRegionCodeValue,AnatomicRegionCodeMeaning\n"
+            "s1,True,SCT,10200004,Background\n"
+            "s1,False,SCT,10200004,Large bowel\n")
+        try:
+            codes = dcmterm.batch_codes(
+                table, "AnatomicRegionCodeValue",
+                "AnatomicRegionCodingSchemeDesignator", "AnatomicRegionCodeMeaning")
+        finally:
+            table.unlink()
+        self.assertEqual(codes[("SCT", "10200004")]["segments"], 1)
+
+
+class TestDcmtermEntireFlavour(unittest.TestCase):
+    """Issue 8's evidence: the "Entire" code absent from DICOM's set, the
+    structure flavour present."""
+
+    def suggest_for(self, code, fsn):
+        return dcmterm.suggest(
+            [{"CodingSchemeDesignator": "SCT", "CodeValue": code, "fsn": fsn,
+              "isEntireFlavour": "True", "segments": "7"}], DCM)[0]
+
+    def test_structure_counterpart_is_suggested(self):
+        row = self.suggest_for("302508007", "Entire colon (body structure)")
+        self.assertEqual(row["inDcmterm"], "False")
+        self.assertEqual(row["suggestedReplacement"], "71854001")
+        self.assertEqual(row["replacementMeaning"], "Colon")
+
+    def test_semantic_tag_is_stripped_before_matching(self):
+        self.assertEqual(
+            dcmterm.strip_semantic_tag("Entire colon (body structure)"),
+            "Entire colon")
+
+    def test_exact_match_beats_a_more_used_partial_match(self):
+        """"Sigmoid colon" contains "colon" and would otherwise compete."""
+        row = self.suggest_for("302508007", "Entire colon (body structure)")
+        self.assertIn("60184004", row["otherCandidates"])
+
+    def test_no_candidate_leaves_the_field_empty_for_a_decision(self):
+        row = self.suggest_for("999999", "Entire zygomatic arch (body structure)")
+        self.assertEqual(row["suggestedReplacement"], "")
+
+    def test_codes_not_flagged_are_ignored(self):
+        self.assertEqual(
+            dcmterm.suggest([{"CodeValue": "78961009", "fsn": "Spleen structure",
+                              "isEntireFlavour": "False"}], DCM), [])
 
 
 if __name__ == "__main__":

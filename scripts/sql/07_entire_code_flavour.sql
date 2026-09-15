@@ -12,19 +12,22 @@
 # it. DICOM's context groups draw on the structure flavour, so a segmentation of
 # part of an organ coded "Entire ..." asserts more than was segmented.
 #
-# EVIDENCE, since PS3.16 section 6 does not state the rule: every "Entire" code
-# in the source batch was ABSENT from the DICOM-derived code table, while the
-# structure counterpart was PRESENT for each one that had a findable
-# equivalent. Argue it that way, from DICOM's own code set, rather than
-# asserting a preference.
+# PS3.16 section 6 does not state the rule, so BUILD THE EVIDENCE PER BATCH:
+# show that each "Entire" code the batch uses is ABSENT from the DICOM-derived
+# code table while its structure counterpart is PRESENT. Argue it that way, from
+# DICOM's own code set, rather than asserting a preference. scripts/dcmterm.py
+# suggest reports both halves against the public dcmterms Parquet, and names the
+# DICOM edition.
 #
 # Detection is mechanical once you have fully specified names: flag every code
 # whose FSN begins "Entire ". scripts/lookup_codes.py does that and writes
-# isEntireFlavour; fill the list below from its output.
+# isEntireFlavour; scripts/dcmterm.py suggest then turns that file into this
+# list, with column names matching the struct below.
 #
 # SPLIT THE FINDING. Codes with a drop-in structure equivalent are a
-# substitution; codes without one need a decision and may also be at the wrong
-# granularity. In the source batch that was 111 segments versus 31.
+# substitution; codes without one - typically the more specific lymph-node and
+# region concepts, for which SNOMED has no "structure" sibling - need a decision
+# and may also be at the wrong granularity.
 #
 # Watch for codes with two problems at once: 181616008 was both the entire
 # flavour AND used for a meaning that contradicts it under issue 1.

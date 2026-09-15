@@ -13,8 +13,9 @@
 # AnatomicRegionModifierSequence (0008,2220), baseline CID 2, or
 # SegmentedPropertyTypeModifierCodeSequence (0062,0011) - with laterality from
 # CID 244: 7771000 Left, 24028007 Right, 66459002 Unilateral, 51440002
-# Bilateral. CHECK WHICH MECHANISM THE BATCH USES before reporting: one batch
-# populated neither, another carried laterality on 26,428 segments in 0062,0011.
+# Bilateral. CHECK WHICH MECHANISM THE BATCH USES before reporting: a
+# pre-coordinating batch populates neither sequence, while a post-coordinating
+# one may use either, and 0062,0011 is as likely as 0008,2220.
 #
 # Where no pre-coordinated code exists for a side, the laterality falls into
 # free text (UNCODED). Where two similar codes exist, picking the wrong one
@@ -24,9 +25,10 @@
 # PS3.3 10.5 defines the modifier mechanism and the laterality context groups
 # but does not require post- over pre-coordination.
 #
-# The one genuine inversion found in the source batch was ABSENT from the
-# DICOM-derived code table, so no automated sweep would have caught it. That
-# segment is the argument for doing the code review by hand.
+# EXPECT INVERSIONS TO BE RARE AND EASY TO MISS. An inverted code can sit
+# outside the DICOM-derived code table, where no automated sweep reaches it and
+# only a human comparing codes to fully specified names finds it. That is the
+# argument for doing the code review by hand.
 
 SELECT
   # description:

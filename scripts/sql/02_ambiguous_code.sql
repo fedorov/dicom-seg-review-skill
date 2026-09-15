@@ -5,9 +5,9 @@
 # CodeMeaning across the batch.
 #
 # One row per segment. FULLY COMPUTED - no curation - so this is the query to
-# run FIRST against a new delivery. It is the highest-yield check (46% of
-# segments in one batch) and it produces the shortlist that 05_anatomy_conflict
-# and 06_laterality then judge by hand.
+# run FIRST against a new delivery. It is typically the highest-yield check in
+# the set, and it produces the shortlist that 05_anatomy_conflict and
+# 06_laterality then judge by hand.
 #
 # Consequence worth stating in the report: neither field works as a grouping
 # key. Grouping on AnatomicRegionCodeValue merges segments labelled as different

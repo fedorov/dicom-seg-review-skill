@@ -142,8 +142,9 @@ SELECT
   segInstances.FrameOfReferenceUID,
 
   # description:
-  # DICOM SegmentLabel (0062,0005). Usually NOT independent evidence: in one
-  # batch it was the CodeMeaning plus an enumerator in 91% of segments.
+  # DICOM SegmentLabel (0062,0005). Usually NOT independent evidence - it is
+  # commonly the CodeMeaning plus an enumerator. Measure how often the two
+  # differ before leaning on it.
   segment.SegmentLabel,
 
   # description:

@@ -1,7 +1,7 @@
 # Access path: BigQuery metadata table
 
-The proven path, and the right one whenever it is available: the checks are set-based,
-so a whole delivery is one query rather than one request per series.
+The right path whenever it is available: the checks are set-based, so a whole delivery
+is one query rather than one request per series.
 
 ## What counts as a source table
 
@@ -9,7 +9,7 @@ Two flavours, both of which the templates in `scripts/sql/` handle:
 
 | Source | Example | Notes |
 |---|---|---|
-| **Google Healthcare API metadata export** of a DICOM store | `idc-external-040.apollo5.dicom_metadata` | Column exists only if some instance populates the attribute — see below |
+| **Google Healthcare API metadata export** of a DICOM store | `<project>.<dataset>.dicom_metadata` | Column exists only if some instance populates the attribute — see below |
 | **IDC public metadata** | `bigquery-public-data.idc_current.dicom_all` | Carries `collection_id`; clustered on it |
 
 The export schema is the DICOM keyword tree: sequences are `ARRAY<STRUCT>`, so
@@ -31,13 +31,13 @@ WHERE table_name = '<table>'
 ORDER BY field_path"
 ```
 
-Attributes that were absent in real batches, and what their absence means:
+Attributes commonly absent, and what their absence means:
 
-| Attribute | Absent from | Meaning |
-|---|---|---|
-| `TrackingID` / `TrackingUID` (0062,0020/0021) | the AI batch | No instance tracks findings — issue 7 does not apply |
-| `AnatomicRegionModifierSequence` (0008,2220) | the manual batch | Laterality is pre-coordinated — issue 3's root cause |
-| `SegmentAlgorithmName` (0062,0009) | the manual batch | No algorithm identification recorded |
+| Attribute | Meaning if absent |
+|---|---|
+| `TrackingID` / `TrackingUID` (0062,0020/0021) | No instance tracks findings — issue 7 does not apply |
+| `AnatomicRegionModifierSequence` (0008,2220) | Laterality is pre-coordinated — issue 3's root cause |
+| `SegmentAlgorithmName` (0062,0009) | No algorithm identification recorded |
 
 **An absent attribute is itself a finding.** Report it rather than working around it
 silently.
@@ -51,8 +51,8 @@ re-delivery can remove one.
 the viewer URL pattern, then deploy it as a view so every check reads one definition:
 
 ```bash
-sed -e 's|@@SOURCE_TABLE@@|idc-external-040.apollo5.dicom_metadata|' \
-    -e 's|@@IMAGE_TABLE@@|idc-external-040.apollo5.dicom_metadata|' \
+sed -e 's|@@SOURCE_TABLE@@|<project>.<dataset>.dicom_metadata|' \
+    -e 's|@@IMAGE_TABLE@@|<project>.<dataset>.dicom_metadata|' \
     -e 's|@@VIEWER_BASE@@|https://viewer.example.org/...|' \
     scripts/sql/01_seg_attributes.sql > /tmp/seg_attributes.sql
 
@@ -62,8 +62,7 @@ bq mk --project_id=<project> --use_legacy_sql=false \
 ```
 
 `@@SOURCE_TABLE@@` and `@@IMAGE_TABLE@@` are separate on purpose — see "When the
-segmented images are elsewhere" below. Both templates were dry-run against a real
-store of each shape.
+segmented images are elsewhere" below.
 
 Deploy **from files in version control, never by editing a view in the console** — a
 console edit leaves no history, and a view that exists nowhere else has to be recovered
@@ -95,12 +94,12 @@ Two store shapes, and they need different substitutions:
 | Images **and** segmentations | the table | the same table |
 | **Only** segmentations | the table | wherever the images live, e.g. `bigquery-public-data.idc_current.dicom_all` |
 
-A segmentation-only store needs one more edit. Its `ReferencedSeriesSequence` carries
-nothing but `SeriesInstanceUID`, where a store written by highdicom also copies
-`Modality` and `BodyPartExamined` into it. Verified on two real stores:
+A segmentation-only store needs one more edit. Its `ReferencedSeriesSequence` often
+carries nothing but `SeriesInstanceUID`, where a store holding the images alongside
+also copies `Modality` and `BodyPartExamined` into it:
 
 ```
-apollo5.dicom_metadata            IDC segmentation store
+images + segmentations            segmentations only
   ReferencedSeriesSequence          ReferencedSeriesSequence
     .SeriesInstanceUID                .SeriesInstanceUID
     .Modality                         .ReferencedInstanceSequence...
@@ -148,7 +147,31 @@ done
 
 Deploy `04_code_review_template.sql` as a **view of its own** and have `05`, `06` and
 `12` join it. Editing a verdict then means editing one file, not three. The alternative
-— inline code lists in each query — was tried first and drifted immediately.
+— inline code lists in each query — drifts out of sync almost immediately.
+
+### The one table that is not yours: DICOM's code set
+
+`03` joins `@@DCMTERM_TABLE@@`, the codes DICOM's own context groups use. It is public
+— [fedorov/dcmterms](https://github.com/fedorov/dcmterms) publishes it as Parquet — so
+load a copy rather than hunting for someone's private table:
+
+```bash
+curl -LO https://raw.githubusercontent.com/fedorov/dcmterms/main/docs/data/codes_unique.parquet
+bq load --project_id=<project> --source_format=PARQUET \
+  <dataset>.dcmterm_codes_unique codes_unique.parquet
+```
+
+Join on **`SELECT DISTINCT`** pairs, as the template does: the table is deduplicated on
+the meaning as well as the code, so `21974007` appears as both "Tongue" and "tongue".
+
+Reload it when a new DICOM edition lands, and record the edition from
+`extraction_metadata.json` in the report — "not in DICOM's code set" is a claim about
+one edition.
+
+The alternative is to skip `03` in BigQuery entirely and run `scripts/dcmterm.py
+coverage` over the exported per-segment CSV. It reads the Parquet directly, needs no
+load step, and also reports codes that *are* in the set but carry a meaning DICOM does
+not use for them — a computed issue-1 signal the SQL does not produce.
 
 ## Cost control while developing
 
@@ -156,7 +179,7 @@ Add a collection or patient restriction to the source CTE:
 
 ```sql
 AND collection_id = 'some_collection'   # IDC
-AND PatientID = 'AP-1234'               # a single-patient smoke test
+AND PatientID = '<one-patient>'         # a single-patient smoke test
 ```
 
 Remove it before producing numbers for the report, and dry-run anything unfamiliar:
