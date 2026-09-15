@@ -1,9 +1,9 @@
 ---
 name: dicom-seg-review
-description: Review a delivery of DICOM Segmentation (SEG) objects for metadata defects — anatomic codes that contradict their own CodeMeaning, one code used with conflicting meanings, inverted or uncoded laterality, non-conformant segments, ambiguous TrackingUIDs, wrong SNOMED code flavour — and produce a severity-ranked report plus a per-series triage list. Use when asked to audit, QC, review or sanity-check DICOM segmentations or their anatomic/SNOMED coding, whether the metadata is reachable through BigQuery, a DICOMweb store, or local DICOM files.
+description: Review a delivery of DICOM Segmentation (SEG) objects for defects in how they are coded and encoded — anatomic codes that contradict their own CodeMeaning, one code used with conflicting meanings, inverted or uncoded laterality, IOD non-conformance and malformed pixel data found by dciodvfy, retired coding scheme designators, ambiguous TrackingUIDs, wrong SNOMED code flavour — and produce a severity-ranked report plus a per-series triage list. Use when asked to audit, QC, review, validate or sanity-check DICOM segmentations, their anatomic/SNOMED coding, or their conformance to the Segmentation IOD, whether the objects are reachable through BigQuery, a DICOMweb store, or local DICOM files.
 license: Apache-2.0
 metadata:
-  version: 1.1.0
+  version: 1.2.0
   skill-author: Andrey Fedorov, @fedorov
 ---
 
@@ -11,11 +11,18 @@ metadata:
 
 ## Overview
 
-Audits the **metadata** of DICOM Segmentation objects — not the pixels. It finds the
-defects that make a segmentation delivery unusable downstream: a segment that says
-"Large bowel" while its code denotes the liver, one code carrying five different
-meanings, a left structure coded as the right one, a segment missing Type 1
-attributes.
+Audits how DICOM Segmentation objects are **coded and encoded**. It finds the defects
+that make a segmentation delivery unusable downstream: a segment that says "Large
+bowel" while its code denotes the liver, one code carrying five different meanings, a
+left structure coded as the right one, a segment missing Type 1 attributes, an object
+whose `PixelData` is the wrong length for the frames it claims.
+
+**The boundary is the voxel values, not the pixel data.** Nothing here interprets what
+was segmented, so it cannot tell you the liver segmentation covers the liver. It does
+check that the pixel data is the size the metadata says it is — `dciodvfy` reads
+`PixelData` and compares its length against Rows × Columns × Frames × BitsAllocated,
+which catches a truncated or mis-framed object that every other check would pass.
+Everything except issue 9 works from metadata alone.
 
 **Two deliverables**, both described in `references/reporting.md`:
 1. A severity-ranked issue report — what is wrong, how much of the batch, worked
@@ -29,7 +36,7 @@ Every check falls into exactly one of two layers, and they must not be mixed:
 
 | Layer | Needs | Follows a new delivery? |
 |---|---|---|
-| **Computed** — ambiguity, conformance, TrackingUID, coverage gap | Nothing but the data | **Yes**, automatically |
+| **Computed** — ambiguity, IOD conformance, retired schemes, TrackingUID, coverage gap | Nothing but the data (plus `dciodvfy` for the IOD) | **Yes**, automatically |
 | **Curated** — "this code denotes different anatomy than its meaning" | A human comparing a code to its SNOMED FSN | **No**, must be re-derived |
 
 Keep the curated verdicts in **one** place (a review table keyed on
@@ -54,6 +61,12 @@ that. Pick by what access you have:
 
 If more than one is available, prefer BigQuery — the checks are set-based and a
 whole delivery is one query.
+
+**One check needs the files themselves.** Issue 9 runs `dciodvfy` against each
+object, and neither a metadata table nor a DICOMweb metadata response is an
+object. Where the delivery is reachable as files, run it; where it is not,
+retrieve a sample and say in the report that IOD conformance was checked on a
+sample, or not at all. Silence on issue 9 must not read as a pass.
 
 ## Workflow
 
@@ -80,6 +93,12 @@ data never had a problem with.
      Public Parquet from [dcmterms](https://github.com/fedorov/dcmterms), cached
      locally — no BigQuery, no credentials. Produces both the coverage-gap deliverable
      and a computed shortlist of meaning disagreements.
+   - **Against the IOD** (`scripts/dciodvfy_check.py`), if the files are on disk.
+     `dciodvfy` reads the whole Segmentation IOD, so it supersedes the hand-rolled
+     Type 1 check. It validates **structure, not semantics** — it will never find a
+     miscoded anatomic region, and a clean run is not a statement about the coding.
+   - Retired coding scheme designators (`SRT`, `SNM3`). Cheap, and it decides
+     whether the terminology steps below can work at all — see the trap below.
    - Conformance, type-repeats-category, SegmentsOverlap, TrackingUID.
 
 4. **Look up every distinct anatomic code's fully specified name** —
@@ -104,6 +123,8 @@ Full detail, DICOM references and detection logic in `references/issue-catalogue
 | 2 | High | Same code used with conflicting meanings across the batch | Computed |
 | 3 | High / Medium | Laterality inverted, or stated in text with no code to carry it | Curated |
 | 8 | Medium | SNOMED "Entire X" flavour where DICOM uses "X structure" | Computed + lookup |
+| 9 | Medium / Low | IOD non-conformance reported by `dciodvfy` | Computed (needs the files) |
+| 10 | Medium | Codes under a retired scheme designator (`SRT`, `SNM3`) | Computed |
 | 4 | Medium | Segment missing a Type 1 attribute, or a code without its scheme | Computed |
 | 7 | Medium | `TrackingUID` shared in a way that does not mean "same finding" | Computed |
 | 5 | Low | `SegmentedPropertyType` merely repeats the category | Computed |
@@ -137,6 +158,28 @@ concluding anything about a batch.
   — `dcmterm.py coverage` prints how many codes and segments it reached — then publish
   the uncovered-code list as a deliverable of its own and check those against a
   terminology server.
+
+- **The SRT trap.** A batch coded under the retired `SRT` designator resolves
+  nowhere: `lookup_codes.py` skips any non-`SCT` scheme, and `dcmterm.py coverage`
+  counts the code as absent from DICOM's context groups without marking it private,
+  because `SRT` is not a `99…` designator. The result is a batch that reports
+  **near-total coverage gap and zero verified codes** and looks like a pile of exotic
+  anatomy. It is not. Check the designator distribution before believing any coverage
+  number, and remember the repair is a re-coding — `T-62000` becomes `10200004`, so
+  swapping the designator alone invents codes that do not exist. Issue 10.
+
+- **A clean `dciodvfy` run says nothing about the coding.** It validates structure
+  against the IOD, not semantics: no context group is consulted for
+  `AnatomicRegionSequence` or `SegmentedPropertyTypeCodeSequence`, so issues 1, 2, 3
+  and 8 are entirely outside its reach. Report the two separately, or "passes the
+  DICOM validator" will be read as "the anatomy was checked".
+
+- **`dciodvfy` needs three flags and an ignored exit status.** `-new` for the
+  attribute path that lets a message be attributed to a segment; `-allpffgitems`
+  because by default only the **first** per-frame functional group item is checked;
+  `-filename` so a batch run can be attributed. Its exit status is 1 for "IOD errors
+  **or** unreadable file" and 0 for "clean **or** warnings only" — parse the output
+  instead, and read it from **stderr**, where all of it goes. Issue 9.
 
 - **Neither field is trustworthy.** Where `CodeValue` and `CodeMeaning` disagree,
   sometimes the code is wrong and sometimes the meaning is. A consumer that
@@ -175,8 +218,9 @@ concluding anything about a batch.
 ## Scripts
 
 Run from the skill root. `seg_checks.py` and `lookup_codes.py` are stdlib-only; the
-extractors need `pydicom` or `dicomweb-client`, and `dcmterm.py` needs any one of
-`pyarrow`, `duckdb` or `pandas` to read Parquet.
+extractors need `pydicom` or `dicomweb-client`, `dcmterm.py` needs any one of
+`pyarrow`, `duckdb` or `pandas` to read Parquet, and `dciodvfy_check.py` needs
+`pip install dicom3tools` (plus `pydicom`, to resolve segment numbers).
 
 ```bash
 # 1. Extract the per-segment table (pick one source)
@@ -184,8 +228,13 @@ python scripts/seg_attributes.py --files /path/to/seg/dir      -o seg_attributes
 python scripts/seg_attributes.py --dicomweb <base-url> --gcp   -o seg_attributes.csv
 #    ...or run scripts/sql/01_seg_attributes.sql as a BigQuery view
 
-# 2. Computed checks + per-series triage
+# 2. Computed checks (issues 2, 4, 5, 6, 7, 10) + per-series triage
 python scripts/seg_checks.py seg_attributes.csv --outdir findings/
+
+#    IOD conformance - local files only. -new, -allpffgitems and -filename are
+#    passed for you; dropping any of them hides findings.
+pip install dicom3tools
+python scripts/dciodvfy_check.py --files /path/to/seg/dir -o findings/
 
 # 3. Against DICOM's own code set: coverage gap + meaning disagreements
 python scripts/dcmterm.py coverage seg_attributes.csv -o findings/coverage.csv
@@ -194,11 +243,14 @@ python scripts/dcmterm.py coverage seg_attributes.csv -o findings/coverage.csv
 python scripts/lookup_codes.py seg_attributes.csv -o findings/codes.csv
 python scripts/dcmterm.py suggest findings/codes.csv -o findings/entire_flavour.csv
 
-# 5. Re-run the checks with the FSNs and your curated verdicts folded in
+# 5. Re-run the checks with the FSNs, the IOD verdict and your curated
+#    verdicts folded into the triage list
 python scripts/seg_checks.py seg_attributes.csv \
-    --codes findings/codes.csv --review review.csv --outdir findings/
+    --codes findings/codes.csv --review review.csv \
+    --iod findings/issue9_iod_validation.csv --outdir findings/
 ```
 
 `scripts/sql/` holds the same checks as BigQuery templates, numbered in run order;
 substitute the table name with `--parameter` or `sed`. See
-`references/access-bigquery.md`.
+`references/access-bigquery.md`. Issue 9 has no SQL form — the validator needs the
+objects, not a metadata table.

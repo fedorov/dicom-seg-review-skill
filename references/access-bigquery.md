@@ -209,3 +209,20 @@ bq query --use_legacy_sql=false --format=csv --max_rows=100000 \
 The CSV in version control is the version of record. If you also publish a spreadsheet
 copy for people who will not run a query, say in the report that it is a snapshot and
 has to be re-imported when the query is re-run.
+
+## Issue 9 is not available here
+
+`dciodvfy` validates a Part 10 object against the Segmentation IOD. A metadata table
+is not an object, so there is no SQL form of issue 9 and `sql/12_series_triage.sql`
+emits no `IOD_ERROR` / `IOD_WARNING` tag. A triage list built entirely on BigQuery is
+**silent** about IOD conformance, not clean.
+
+`sql/08_malformed_segment.sql` still runs and covers the five Type 1 attributes of the
+Segment Description Macro. That is a small subset of what the validator checks, and
+the report should say so where it quotes issue 4.
+
+If the objects are reachable as files anywhere — the bucket the store was loaded from,
+or a WADO-RS retrieval of a sample — run `scripts/dciodvfy_check.py` there and fold
+the result in with `seg_checks.py --iod`. Issue 10, the retired coding scheme
+designators dciodvfy also reports, *is* computable here:
+`sql/13_retired_coding_scheme.sql`.

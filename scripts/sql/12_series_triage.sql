@@ -119,6 +119,17 @@ WITH
         OR seg.SegmentedPropertyCategoryCodeValue IS NULL
         OR seg.SegmentedPropertyTypeCodeValue IS NULL
         OR seg.SegmentAlgorithmType IS NULL AS isMalformed,
+      # Issue 10. SRT/SNM3/SNM/99SDM are retired in favour of SCT - and the
+      # CodeValue changes with the designator, so this is a re-coding job.
+      seg.AnatomicRegionCodingSchemeDesignator IN ('SRT', 'SNM3', 'SNM', '99SDM')
+        OR seg.AnatomicRegionModifierCodingSchemeDesignator
+             IN ('SRT', 'SNM3', 'SNM', '99SDM')
+        OR seg.SegmentedPropertyCategoryCodingSchemeDesignator
+             IN ('SRT', 'SNM3', 'SNM', '99SDM')
+        OR seg.SegmentedPropertyTypeCodingSchemeDesignator
+             IN ('SRT', 'SNM3', 'SNM', '99SDM')
+        OR seg.SegmentedPropertyTypeModifierCodingSchemeDesignator
+             IN ('SRT', 'SNM3', 'SNM', '99SDM') AS isRetiredScheme,
       seg.TrackingUID IN (SELECT TrackingUID FROM ambiguousTrackingUIDs)
         AS isTrackingAmbiguous,
       seg.TrackingUID IN (SELECT TrackingUID FROM crossPatientTrackingUIDs)
@@ -156,6 +167,7 @@ WITH
       COUNTIF(isLateralityUncoded) AS nLateralityUncoded,
       COUNTIF(isEntireFlavour) AS nEntireFlavour,
       COUNTIF(isMalformed) AS nMalformed,
+      COUNTIF(isRetiredScheme) AS nRetiredScheme,
       COUNTIF(isTrackingAmbiguous) AS nTrackingAmbiguous,
       COUNTIF(isTrackingCrossPatient) AS nTrackingCrossPatient,
       COUNTIF(isSpellingVariant) AS nSpellingVariant,
@@ -198,11 +210,18 @@ SELECT
   #   ENTIRE_CODE_FLAVOUR      (Medium) 07_entire_code_flavour.sql
   #   LATERALITY_UNCODED       (Medium) 06_laterality.sql
   #   MALFORMED_SEGMENT        (Medium) 08_malformed_segment.sql
+  #   RETIRED_CODING_SCHEME    (Medium) 13_retired_coding_scheme.sql
   #   TRACKINGUID_AMBIGUOUS    (Medium) 11_tracking_uid.sql
   #   COSMETIC_VARIANT         (Low)    02_ambiguous_code.sql
   #   CODE_MEANING_SPELLING    (Low)    05_anatomy_conflict.sql
   #   TYPE_REPEATS_CATEGORY    (Low)    09_type_repeats_category.sql
   #   NO_SEGMENTS_OVERLAP      (Low)    10_segments_overlap_absent.sql
+  # Issue 9's IOD_ERROR / IOD_WARNING are deliberately ABSENT here. They come
+  # from dciodvfy, which validates objects, not a metadata table, so they are
+  # only available on the local-files path - scripts/seg_checks.py --iod adds
+  # them there. A triage list built from this query is silent about IOD
+  # conformance; say so rather than letting the silence read as a pass.
+  #
   #   CODE_AMBIGUOUS_ELSEWHERE (context) a code this series uses is used with
   #     another meaning by some OTHER series. No evidence this series is wrong,
   #     so it does not raise worstSeverity. NOT A WORK QUEUE.
@@ -217,6 +236,7 @@ SELECT
         IF(nEntireFlavour > 0, 'ENTIRE_CODE_FLAVOUR', NULL),
         IF(nLateralityUncoded > 0, 'LATERALITY_UNCODED', NULL),
         IF(nMalformed > 0, 'MALFORMED_SEGMENT', NULL),
+        IF(nRetiredScheme > 0, 'RETIRED_CODING_SCHEME', NULL),
         IF(nTrackingAmbiguous > 0, 'TRACKINGUID_AMBIGUOUS', NULL),
         IF(nCosmetic > 0, 'COSMETIC_VARIANT', NULL),
         IF(nSpellingVariant > 0, 'CODE_MEANING_SPELLING', NULL),

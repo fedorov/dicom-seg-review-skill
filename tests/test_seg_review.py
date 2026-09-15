@@ -8,17 +8,22 @@ spanning two patients.
 
   python -m pytest tests/ -q        (or: python tests/test_seg_review.py)
 
-Needs pydicom, for Dataset only - nothing is read from disk.
+Needs pydicom, for Dataset only - nothing is read from disk. The dciodvfy tests
+run against captured output rather than the binary, so the suite still needs
+neither network nor dicom3tools; the captures are real dciodvfy -new output,
+copied verbatim.
 """
 
 import sys
 import unittest
+from collections import Counter, defaultdict
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 from pydicom.dataset import Dataset  # noqa: E402
 
+import dciodvfy_check  # noqa: E402
 import dcmterm  # noqa: E402
 import seg_attributes  # noqa: E402
 import seg_checks  # noqa: E402
@@ -496,6 +501,232 @@ class TestDcmtermEntireFlavour(unittest.TestCase):
         self.assertEqual(
             dcmterm.suggest([{"CodeValue": "78961009", "fsn": "Spleen structure",
                               "isEntireFlavour": "False"}], DCM), [])
+
+
+# Real `dciodvfy -new -filename -allpffgitems` output, copied verbatim from runs
+# against deliberately broken segmentations. Captured rather than generated so
+# the suite pins the grammar the parser depends on: if a dicom3tools build
+# changes the message format, these are what should fail.
+DCIODVFY_OUTPUT = """Filename: "broken.dcm"
+Warning - </PatientName(0010,0010)[1]> - Value dubious for this VR [PN] = \
+<JANCT000> - Retired Person Name form
+Segmentation
+Error - </ContentLabel(0070,0080)> - Missing attribute for Type 1 Required - \
+Module=<ContentIdentificationMacro>
+Error - </SegmentSequence(0062,0002)[2]/SegmentLabel(0062,0005)> - Missing \
+attribute for Type 1 Required - Module=<SegmentDescriptionMacro>
+Error - </SegmentSequence(0062,0002)[2]/SegmentAlgorithmType(0062,0008)[1]> - \
+Unrecognized enumerated value = <MAGIC>
+Error - </ImageType(0008,0008)> - Bad attribute Value Multiplicity = <1> (2-n \
+Required by Dictionary) Module=<GeneralImage>
+Error - </PerFrameFunctionalGroupsSequence(5200,9230)[3]/\
+SegmentIdentificationSequence(0062,000a)> - Missing attribute for Type 1 \
+Required - Module=<SegmentationMacro>
+Warning - </SegmentSequence(0062,0002)[1]/SegmentedPropertyTypeCodeSequence\
+(0062,000f)[1]/CodingSchemeDesignator(0008,0102)[1]> - CodingSchemeDesignator \
+is deprecated = <SRT>
+""".replace("\\\n", "")
+
+
+class TestDciodvfyParser(unittest.TestCase):
+    """Issue 9. The parser is the part that has to be right - everything after
+    it is aggregation."""
+
+    def setUp(self):
+        self.iod, self.findings = dciodvfy_check.parse_output(DCIODVFY_OUTPUT)
+        self.by_attribute = {f["attributeName"]: f for f in self.findings}
+
+    def test_iod_is_captured(self):
+        """If dciodvfy picked the wrong IOD, every message is about the wrong
+        rules - so the name it printed has to survive parsing."""
+        self.assertEqual(self.iod, "Segmentation")
+
+    def test_filename_line_is_not_a_finding(self):
+        self.assertEqual(len(self.findings), 7)
+
+    def test_type1_message_is_classified_and_located(self):
+        finding = self.by_attribute["SegmentLabel"]
+        self.assertEqual(finding["messageClass"], "MISSING_TYPE1")
+        self.assertEqual(finding["module"], "SegmentDescriptionMacro")
+        self.assertEqual(finding["attributeTag"], "0062,0005")
+        self.assertEqual(finding["segmentItem"], 2)
+
+    def test_object_level_message_has_no_segment_item(self):
+        self.assertEqual(self.by_attribute["ContentLabel"]["segmentItem"], "")
+
+    def test_per_frame_message_carries_the_frame_index(self):
+        """-allpffgitems is what makes this message exist at all; the index is
+        what lets it be attributed to a frame rather than to the whole file."""
+        finding = self.by_attribute["SegmentIdentificationSequence"]
+        self.assertEqual(finding["frameItem"], 3)
+        self.assertEqual(finding["segmentItem"], "")
+
+    def test_module_without_a_dash_separator_is_still_stripped(self):
+        """Bad-VM messages put Module=<> straight after the value, with no
+        " - " in front of it, unlike every other message."""
+        finding = self.by_attribute["ImageType"]
+        self.assertEqual(finding["module"], "GeneralImage")
+        self.assertNotIn("Module=", finding["message"])
+        self.assertEqual(finding["valueSeen"], "1")
+
+    def test_enumerated_value_is_extracted(self):
+        finding = self.by_attribute["SegmentAlgorithmType"]
+        self.assertEqual(finding["messageClass"], "BAD_ENUMERATED_VALUE")
+        self.assertEqual(finding["valueSeen"], "MAGIC")
+        self.assertEqual(finding["module"], "")
+
+    def test_deprecated_scheme_warning_is_promoted_to_medium(self):
+        """dciodvfy calls it a Warning. It silently breaks every terminology
+        lookup downstream, so the review does not."""
+        finding = self.by_attribute["CodingSchemeDesignator"]
+        self.assertEqual(finding["dciodvfySeverity"], "Warning")
+        self.assertEqual(finding["severity"], "Medium")
+        self.assertEqual(finding["messageClass"], "DEPRECATED_CODING_SCHEME")
+
+    def test_nothing_is_ever_high(self):
+        """A dciodvfy message IS the detection, and High is reserved for what
+        cannot be detected."""
+        self.assertNotIn("High", {f["severity"] for f in self.findings})
+
+    def test_plain_warning_is_low(self):
+        self.assertEqual(self.by_attribute["PatientName"]["severity"], "Low")
+
+    def test_signature_blanks_values_so_counts_aggregate(self):
+        self.assertEqual(
+            dciodvfy_check.signature("Unrecognized enumerated value = <MAGIC>"),
+            "Unrecognized enumerated value = <>")
+
+    def test_unknown_message_is_kept_not_dropped(self):
+        _, findings = dciodvfy_check.parse_output(
+            "Segmentation\nError - </Foo(0008,0008)> - Something new entirely\n")
+        self.assertEqual(findings[0]["messageClass"], "OTHER")
+        self.assertEqual(findings[0]["message"], "Something new entirely")
+
+    def test_pixel_data_length_is_classified(self):
+        """The one message that is not about metadata: dciodvfy reads PixelData
+        and checks its length against the declared geometry. Nothing else in
+        the review would notice a truncated object."""
+        _, findings = dciodvfy_check.parse_output(
+            "Segmentation\nError - </PixelData(7fe0,0010)> - PixelData has "
+            "incorrect value length = <98304> - expected 131072 dec\n")
+        self.assertEqual(findings[0]["messageClass"], "BAD_VALUE_LENGTH")
+        self.assertEqual(findings[0]["attributeName"], "PixelData")
+        self.assertEqual(findings[0]["severity"], "Medium")
+
+    def test_message_without_an_attribute_path_still_parses(self):
+        _, findings = dciodvfy_check.parse_output(
+            "Error - Information Object Not found\n")
+        self.assertEqual(findings[0]["attributePath"], "")
+        self.assertEqual(findings[0]["severity"], "Medium")
+
+
+class TestDciodvfySegmentAttribution(unittest.TestCase):
+    """The sequence item index dciodvfy prints is a position, not a
+    SegmentNumber. On a labelmap they differ by one."""
+
+    def test_item_index_maps_to_the_actual_segment_number(self):
+        ds = instance([segment(0, "Background"), segment(1, "Liver")])
+        index = dciodvfy_check.segment_index(ds)
+        self.assertEqual(index[1], ("0", "Background"))
+        self.assertEqual(index[2], ("1", "Liver"))
+
+    def test_missing_segment_number_leaves_the_field_empty(self):
+        ds = instance([segment(1, "A", omit=("SegmentNumber",))])
+        self.assertEqual(dciodvfy_check.segment_index(ds)[1], ("", "A"))
+
+    def test_summary_counts_distinct_objects_series_and_segments(self):
+        rows = [
+            {"severity": "Medium", "dciodvfySeverity": "Error",
+             "messageClass": "MISSING_TYPE1", "attributeName": "SegmentLabel",
+             "attributeTag": "0062,0005", "module": "SegmentDescriptionMacro",
+             "messageSignature": "Missing attribute for Type 1 Required",
+             "SOPInstanceUID": sop, "SeriesInstanceUID": "S1",
+             "SegmentNumber": "1", "valueSeen": "", "viewer_url": ""}
+            for sop in ("1.1", "1.2")
+        ]
+        summary = dciodvfy_check.summarise(rows)
+        self.assertEqual(len(summary), 1)
+        self.assertEqual(summary[0]["instances"], 2)
+        self.assertEqual(summary[0]["series"], 1)
+        self.assertEqual(summary[0]["segments"], 2)
+
+
+class TestRetiredCodingScheme(unittest.TestCase):
+    """Issue 10. Computed, so it runs on every access path - which is the whole
+    reason it is not just folded into issue 9."""
+
+    def test_srt_designator_is_reported_with_its_sequences(self):
+        rows = rows_for([instance([segment(
+            1, "Liver", region=("T-62000", "Liver", "SRT"), category="",
+            seg_type="")])])
+        findings = seg_checks.retired_scheme(rows)
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0]["retiredSchemes"], "SRT")
+        self.assertEqual(findings[0]["replacementScheme"], "SCT")
+        self.assertIn("AnatomicRegionCodeSequence=SRT:T-62000",
+                      findings[0]["affectedSequences"])
+
+    def test_sct_is_clean(self):
+        rows = rows_for([instance([segment(1, "Liver",
+                                           region=("10200004", "Liver"))])])
+        self.assertEqual(seg_checks.retired_scheme(rows), [])
+
+    def test_a_designator_with_no_code_value_is_not_reported(self):
+        """An empty sequence is issue 4's business, not issue 10's."""
+        rows = rows_for([instance([segment(1, "A")])])
+        for row in rows:
+            row["AnatomicRegionCodingSchemeDesignator"] = "SRT"
+            row["AnatomicRegionCodeValue"] = ""
+        self.assertEqual(seg_checks.retired_scheme(rows), [])
+
+    def test_it_raises_series_severity_to_medium(self):
+        rows = rows_for([instance([segment(
+            1, "Liver", region=("T-62000", "Liver", "SRT"))], overlap="NO")])
+        out = seg_checks.triage(rows, {}, set(), {}, {}, [])
+        self.assertIn("RETIRED_CODING_SCHEME", out[0]["issues"])
+        self.assertEqual(out[0]["worstSeverity"], "Medium")
+        # It is a re-coding job, not a per-segment judgement call.
+        self.assertEqual(out[0]["segmentsNeedingRecode"], 0)
+
+
+class TestIodTagsJoinTheTriage(unittest.TestCase):
+    """Issue 9 is per object; the triage list is per series."""
+
+    def setUp(self):
+        self.rows = rows_for([instance([segment(1, "A",
+                                                region=("78961009", "Spleen"))],
+                                       series="S1", overlap="NO")])
+
+    def triage_with(self, messages):
+        iod = defaultdict(Counter)
+        for series, severity, message_class in messages:
+            if message_class == "DEPRECATED_CODING_SCHEME":
+                continue
+            tag = "IOD_ERROR" if severity == "Error" else "IOD_WARNING"
+            iod[series][tag] += 1
+        return seg_checks.triage(self.rows, {}, set(), {}, {}, [], iod)
+
+    def test_an_error_makes_the_series_medium(self):
+        out = self.triage_with([("S1", "Error", "MISSING_TYPE1")])
+        self.assertIn("IOD_ERROR", out[0]["issues"])
+        self.assertEqual(out[0]["worstSeverity"], "Medium")
+
+    def test_a_warning_only_makes_it_low(self):
+        out = self.triage_with([("S1", "Warning", "DUBIOUS_VALUE_FOR_VR")])
+        self.assertEqual(out[0]["issues"], "IOD_WARNING")
+        self.assertEqual(out[0]["worstSeverity"], "Low")
+
+    def test_without_the_validator_the_series_carries_no_iod_tag(self):
+        """Silence here means "not checked", not "conformant" - the BigQuery
+        and DICOMweb paths always look like this."""
+        out = seg_checks.triage(self.rows, {}, set(), {}, {}, [])
+        self.assertNotIn("IOD_", out[0]["issues"])
+
+    def test_deprecated_scheme_does_not_double_count_as_an_iod_error(self):
+        """It is issue 10's tag, computed from the table, so that the tag means
+        the same thing on all three access paths."""
+        out = self.triage_with([("S1", "Warning", "DEPRECATED_CODING_SCHEME")])
+        self.assertNotIn("IOD_", out[0]["issues"])
 
 
 if __name__ == "__main__":

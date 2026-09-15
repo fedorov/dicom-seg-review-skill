@@ -54,6 +54,11 @@ That sentence is what a busy reader takes away.
   the link.
 - Where relevant, the **root cause**, separated from the symptom (issue 3's
   pre-coordination; issue 1's carried-over codes).
+- For issue 9, **aggregate by message, not by object**. A list of 40 000 validator
+  messages is not a finding; "every object omits `ContentLabel`" is.
+  `issue9_iod_validation_summary.csv` is already one row per distinct defect with the
+  instances, series and segments it touches. Pair it with the boundary statement:
+  dciodvfy checks structure, so a clean run is not evidence about the coding.
 - Any **reassuring negative** the check establishes. "No TrackingUID is shared across
   patients, and none is repeated within a series" bounds the problem and lets a reader
   respond proportionately. A report that lists only what is broken cannot be acted on.
@@ -78,14 +83,18 @@ The exact commands, and — importantly — **which parts will not follow a new 
 > re-checking what they surface. Every other query is fully computed and will follow
 > the data.
 
-**Name the two terminology sources by version**, in the same section:
+**Name every external authority by version**, in the same section — the two
+terminology sources and the IOD validator:
 
 > Codes were checked against DICOM 2026c (dcmterms, extracted 2026-07-02) and, for
 > those DICOM does not carry, against SNOMED CT via `tx.fhir.org` on 2026-09-15.
+> Objects were validated against the IOD with dciodvfy (dicom3tools 20260901).
 
-Both move. "This code is not in DICOM's code set" and "this code is retired" are claims
-about a particular edition on a particular day, and a reader re-running the review a
-year later needs to know which one you saw. `dcmterm.py` prints the line to copy.
+All three move. "This code is not in DICOM's code set", "this code is retired" and
+"this object does not conform" are claims about a particular edition, or a particular
+build, on a particular day, and a reader re-running the review a year later needs to
+know which one you saw. `dcmterm.py` and `dciodvfy_check.py` each print the line to
+copy.
 
 Without that paragraph the next person runs the whole set against a new batch and
 trusts stale verdicts.
@@ -119,15 +128,23 @@ TRACKINGUID_CROSS_PATIENT  High      issue 7
 ENTIRE_CODE_FLAVOUR        Medium    issue 8
 LATERALITY_UNCODED         Medium    issue 3
 MALFORMED_SEGMENT          Medium    issue 4
+RETIRED_CODING_SCHEME      Medium    issue 10
+IOD_ERROR                  Medium    issue 9 - local files only
 TRACKINGUID_AMBIGUOUS      Medium    issue 7
 COSMETIC_VARIANT           Low       issue 2
+IOD_WARNING                Low       issue 9 - local files only
 CODE_MEANING_SPELLING      Low       issue 1
 TYPE_REPEATS_CATEGORY      Low       issue 5
 NO_SEGMENTS_OVERLAP        Low       issue 6
 CODE_AMBIGUOUS_ELSEWHERE   context   issue 2 — does NOT raise worstSeverity
 ```
 
-`scripts/seg_checks.py` and `scripts/sql/12_series_triage.sql` emit the same tags.
+`scripts/seg_checks.py` and `scripts/sql/12_series_triage.sql` emit the same tags,
+with one exception: `IOD_ERROR` and `IOD_WARNING` come from `dciodvfy`, which needs
+the objects rather than a metadata table, so the SQL cannot produce them. A triage
+list built on BigQuery is **silent** about IOD conformance. Say that in the report
+rather than letting the silence read as a pass.
+
 `COSMETIC_VARIANT` differs in how it is decided: the SQL reads a curated code list,
 while the script offers near-match candidates (`cosmeticCandidate` in
 `issue2_ambiguous_code.csv`) for you to confirm. Confirm them before quoting the Low

@@ -1,6 +1,6 @@
 # Issue catalogue
 
-The eight checks. Each gives what the defect is, why it matters, how to detect it, and
+The ten checks. Each gives what the defect is, why it matters, how to detect it, and
 what the finding looks like in practice.
 
 Numbering is stable. Add new issues with the next free number; do not renumber, since
@@ -157,6 +157,13 @@ key; say so when you claim that key.
 **Exclude Background segments first** on labelmap deliveries, or this check fires on
 every object.
 
+**Where the files are on disk, issue 9 supersedes this.** `dciodvfy` reads the whole
+IOD rather than the five attributes of one macro, and finds the same violations plus
+every other Type 1, 1C, 2, VM and enumerated-value breach in the object. This check
+stays because it is all the BigQuery and DICOMweb paths can run. Where both ran, report
+issue 9 and note that issue 4 is its subset, rather than counting the same segment
+twice.
+
 ---
 
 ## 5. SegmentedPropertyType repeats the category
@@ -253,6 +260,163 @@ decision, and those segments may also be at the wrong granularity.
 
 Watch for codes with **two problems at once**: `181616008` "Entire peritoneal cavity"
 used for "Peritoneal deposit" is both the entire flavour *and* an issue 1 conflict.
+
+---
+
+## 9. The object does not conform to the Segmentation IOD
+
+**Severity: Medium for an Error, Low for a Warning — never High.** **Layer: computed,
+by an external validator.**
+
+`dciodvfy` (David Clunie's [dicom3tools](https://github.com/ImagingDataCommons/dicom3tools-python-distributions),
+`pip install dicom3tools`) validates an object against the IOD definition in PS3.3:
+which modules a Segmentation must carry, which of their attributes are Type 1, 1C, 2 or
+3, their value multiplicity, their enumerated values, and whether each frame's
+`ReferencedSegmentNumber` names a segment that exists. It is the authority on
+structure, and it supersedes issue 4 wherever the files are on disk — issue 4 hand-rolls
+five Type 1 attributes from one macro, this reads the whole IOD.
+
+**It also reads the pixel data — this is the one check in the review that does.**
+dciodvfy compares `PixelData`'s length against Rows × Columns × Frames ×
+BitsAllocated, so it catches a truncated object, or one whose `NumberOfFrames` claims
+more frames than it carries:
+
+```
+Error - </PixelData(7fe0,0010)> - PixelData has incorrect value length = <98304> \
+- expected 131072 dec
+```
+
+Class `BAD_VALUE_LENGTH` in `issue9_iod_validation.csv`, with `attributeName` =
+`PixelData`. It is a Medium like any other Error — detectable, since any reader
+computes the same expected length — but it is the Medium a consumer feels hardest,
+because the object will not decode. Nothing else in this review would notice it: every
+other check reads metadata only. Call it out separately from the attribute findings.
+
+**Know what it does not do.** dciodvfy validates *structure*, not *semantics*, and it
+interprets no voxel values. It does not check `SegmentedPropertyTypeCodeSequence` or
+`AnatomicRegionSequence` against any context group — confirmed by planting a
+nonexistent code in each and getting silence. Issues 1, 2, 3 and 8 are outside its
+reach entirely, and a clean dciodvfy run says nothing whatever about whether the
+anatomy is coded correctly. Say that in the report, or "passes the DICOM validator"
+will be read as "the coding was checked".
+
+**Severity never reaches High, by construction.** High is reserved for an assertion
+that is false and that the object gives no way to detect. A dciodvfy message *is* the
+detection. Map its own split straight onto the scale: Error → Medium, Warning → Low,
+with the one promotion noted in issue 10.
+
+### Running it
+
+`scripts/dciodvfy_check.py` wraps it, parses the output into the per-segment shape the
+rest of the review uses, and rolls it up:
+
+```bash
+pip install dicom3tools
+python scripts/dciodvfy_check.py --files /path/to/delivery -o findings/
+python scripts/seg_checks.py seg_attributes.csv \
+    --iod findings/issue9_iod_validation.csv --outdir findings/
+```
+
+Three flags matter, and the script passes all three:
+
+- **`-new`.** Without it a message names only the attribute; with it the message carries
+  the full path including sequence item indices —
+  `</SegmentSequence(0062,0002)[1]/SegmentLabel(0062,0005)>`. That index is what lets a
+  message be attributed to a **segment** rather than to a file, which is the whole
+  reason the finding can join the per-series triage list. Never run without it.
+- **`-allpffgitems`.** By default dciodvfy checks only the **first** item of
+  `PerFrameFunctionalGroupsSequence`. A SEG's per-frame defects are rarely in frame 1.
+  Verified: delete `SegmentIdentificationSequence` from the last frame of a three-frame
+  object and the default run reports nothing at all.
+- **`-filename`**, so a batch run's output can be attributed to a file.
+
+### Traps
+
+- **The exit status is not a pass/fail signal.** 1 means "IOD errors **or** the file
+  could not be read"; 0 means "clean **or** warnings only". Parse the output. A batch
+  triaged on exit status alone silently passes every warning and conflates a corrupt
+  file with a non-conformant one.
+
+- **Everything goes to stderr**, including the IOD name and the clean-run output.
+  Redirecting only stdout captures nothing.
+
+- **One file per invocation.** dciodvfy takes a single input; there is no batch mode.
+  `dciodvfy_check.py` parallelises across files for this reason.
+
+- **`-allpffgitems` costs about 10×.** Measured on a 1000-frame object: 0.39 s default,
+  3.9 s with the flag — roughly 4 ms per per-frame item. On a delivery of large
+  multi-frame objects that is hours single-threaded. Budget for it; do not drop the flag
+  to save the time, because dropping it is what hides the findings.
+
+- **Check which IOD it chose.** dciodvfy prints the Information Object it validated
+  against as a bare line — `Segmentation`. If it picked the wrong one, every message
+  below it is about the wrong rules. `dciodvfy_check.py` records it per object in
+  `iod` and prints the distribution; a batch that is not uniformly `Segmentation` needs
+  explaining before anything else in the output is quoted.
+
+- **Labelmap objects (`...66.7`) need a build that knows them.** This one does: it
+  requires `SegmentationType` to be `LABELMAP` for that SOP class and reports `BINARY`
+  there as an unrecognized enumerated value. An older build predating Labelmap
+  Segmentation Storage will not, and will quietly validate against the wrong rules.
+  Test yours against a known-good labelmap object before trusting a labelmap delivery.
+
+- **The sequence item index is not the SegmentNumber.** `SegmentSequence[1]` is the
+  first *item*, which on a labelmap SEG is the Background segment at `SegmentNumber` 0,
+  putting every later index one out. `dciodvfy_check.py` reads the actual
+  `SegmentNumber` out of the item rather than assuming.
+
+- **A dangling `ReferencedSegmentNumber` must not be echoed into the SegmentNumber
+  column.** The reference not resolving *is* the finding; writing 99 into
+  `SegmentNumber` invents a segment 99 that the triage list will then carry.
+
+- **Unrecognised messages.** The parser classifies known message text and files the rest
+  as `OTHER` with the full message kept. Read those before quoting any count as
+  complete — a new dicom3tools build can add message text the classifier has not seen.
+
+### Reporting it
+
+Aggregate by message, not by object: `issue9_iod_validation_summary.csv` gives one row
+per distinct defect with the instances, series and segments it touches, worst first.
+A list of 40 000 messages is not a finding; "every object omits `ContentLabel`" is.
+
+Quote the validator version alongside the terminology versions —
+`dciodvfy_check.py` prints the line. An IOD definition is a claim about one edition of
+PS3.3 as one build of dicom3tools implements it.
+
+---
+
+## 10. Codes recorded under a retired coding scheme designator
+
+**Severity: Medium.** **Layer: computed.**
+
+`SRT`, `SNM3`, `SNM` and `99SDM` are retired designators for the SNOMED family, all
+superseded by `SCT`. dciodvfy reports them ("CodingSchemeDesignator is deprecated"), but
+only as a **Warning**, and only where the files are on disk. This check is separate from
+issue 9, and promoted above dciodvfy's own severity, for two reasons.
+
+**It breaks the terminology work silently.** Everything in this review keyed on
+`(CodingSchemeDesignator, CodeValue)` resolves `SCT` and nothing else.
+`lookup_codes.py` skips a non-`SCT` designator outright, so no FSN is ever fetched and
+issues 1, 3 and 8 have nothing to judge. `dcmterm.py coverage` counts the code as one
+DICOM's context groups do not carry, and since `SRT` is not a `99…` designator it is not
+separated out as private either. **A batch coded entirely in SRT therefore reports
+near-total coverage gap and zero verified codes** — which reads exactly like a batch of
+exotic codes and is nothing of the kind. Check the designator distribution before
+believing any coverage number.
+
+**It is computable from the per-segment table**, so unlike issue 9 it runs on all three
+access paths: `seg_checks.py` always runs it, and `sql/13_retired_coding_scheme.sql` is
+the BigQuery form.
+
+**The fix is a re-coding, not a rename.** An SRT code and its SCT equivalent have
+different `CodeValue`s — `T-62000` "Liver" becomes `10200004`. Swapping the designator
+and keeping the value produces a code that does not exist. Say so explicitly in the
+follow-up section, because "replace SRT with SCT" is the obvious wrong reading and it
+is the annotation producer who has to do the mapping.
+
+Report the designator distribution across the batch, not just the offending count — a
+producer that emits `SRT` in one code sequence normally emits it in all of them, and
+that is one change at the source rather than a per-segment repair.
 
 ---
 

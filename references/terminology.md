@@ -114,6 +114,35 @@ A 404 means the code is not in SNOMED. Private scheme designators (anything that
 not `SCT`, e.g. `DCM`, `99LOCAL`) are skipped by the script — they cannot be looked up
 there and must be judged against whatever defines them.
 
+### `SRT` is skipped too, and that is the trap
+
+`SRT` (and `SNM3`, `SNM`, `99SDM`) is the retired designator for the SNOMED family,
+and its code values are the old style — `T-62000` for the liver, not `10200004`. It is
+not `SCT`, so `lookup_codes.py` skips it and no FSN is ever fetched. It is not a `99…`
+designator either, so `dcmterm.py coverage` counts it as a code DICOM's context groups
+do not carry rather than separating it out as private.
+
+**A batch coded in `SRT` therefore reports near-total coverage gap and zero verified
+codes**, which reads exactly like a batch of exotic anatomy and is nothing of the kind.
+Before quoting any coverage number, check the designator distribution:
+
+```bash
+python - <<'EOF'
+import csv, collections
+rows = list(csv.DictReader(open("seg_attributes.csv")))
+for column in ("AnatomicRegion", "SegmentedPropertyCategory", "SegmentedPropertyType"):
+    print(column, collections.Counter(
+        r[f"{column}CodingSchemeDesignator"] for r in rows).most_common())
+EOF
+```
+
+`seg_checks.py` reports it as issue 10 and `sql/13_retired_coding_scheme.sql` is the
+BigQuery form. The remedy is a per-code mapping from the SNOMED-RT style identifier to
+the SCT concept id, which belongs to the annotation producer — **swapping the
+designator and keeping the value invents codes that do not exist.** Until that mapping
+is done, the terminology half of this review cannot run on those segments, and the
+report must say so rather than presenting the empty result as a clean one.
+
 **Rate-limit**: the script sleeps between requests. A few hundred codes takes a couple
 of minutes; do not parallelise it into a public server.
 

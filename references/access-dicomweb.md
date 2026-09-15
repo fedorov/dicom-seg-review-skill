@@ -118,3 +118,21 @@ https://viewer.imaging.datacommons.cancer.gov/viewer/{StudyInstanceUID}?SeriesIn
   learn the same thing only by extracting everything and finding the column empty —
   which the extractor reports as a coverage summary at the end. Read it: an attribute
   empty across the whole batch is a finding, not a blank column.
+
+## Issue 9 cannot run from here
+
+`dciodvfy` validates a Part 10 object, and a DICOMweb metadata response is not one.
+Retrieving instances with WADO-RS (`application/dicom`) and writing them to disk makes
+the local-files path available — but a SEG's pixel data is the bulk of it, so this is a
+real download, not a metadata request.
+
+Decide deliberately and say which you did:
+
+- **Retrieve a sample** — a few objects per producer and per `SegmentationType` — run
+  `dciodvfy_check.py` over them, and report issue 9 as sampled, giving the sample size.
+  IOD defects are usually systematic, so a sample answers most of the question.
+- **Skip it**, and say in the report that IOD conformance was not checked. The
+  hand-rolled Type 1 check (issue 4) still runs and covers five attributes of one
+  macro; it is not a substitute, and the triage list will carry no `IOD_ERROR` tag
+  whether or not the objects are conformant.
+

@@ -9,12 +9,16 @@ Standard library only, so this runs wherever Python does.
 Usage:
   python seg_checks.py seg_attributes.csv --outdir findings/
   python seg_checks.py seg_attributes.csv --outdir findings/ \\
-      --codes findings/codes.csv --review review.csv
+      --codes findings/codes.csv --review review.csv \\
+      --iod findings/issue9_iod_validation.csv
 
-Computed checks (issues 2, 4, 5, 6, 7) need nothing but the data and will follow
-a new delivery. Issue 8 needs the fully specified names from lookup_codes.py.
-Issues 1 and 3 are curated: they need --review, and a review built against an
-earlier batch is STALE until re-derived. See SKILL.md, "Core rule".
+Computed checks (issues 2, 4, 5, 6, 7, 10) need nothing but the data and will
+follow a new delivery. Issue 8 needs the fully specified names from
+lookup_codes.py. Issue 9 is the IOD validator's verdict, read from
+dciodvfy_check.py via --iod; it needs the files, so it is unavailable on the
+BigQuery and DICOMweb paths. Issues 1 and 3 are curated: they need --review,
+and a review built against an earlier batch is STALE until re-derived. See
+SKILL.md, "Core rule".
 """
 
 import argparse
@@ -36,14 +40,39 @@ SEVERITY = {
     "ENTIRE_CODE_FLAVOUR": "Medium",
     "LATERALITY_UNCODED": "Medium",
     "MALFORMED_SEGMENT": "Medium",
+    "RETIRED_CODING_SCHEME": "Medium",
+    "IOD_ERROR": "Medium",
     "TRACKINGUID_AMBIGUOUS": "Medium",
     "COSMETIC_VARIANT": "Low",
+    "IOD_WARNING": "Low",
     "CODE_MEANING_SPELLING": "Low",
     "TYPE_REPEATS_CATEGORY": "Low",
     "NO_SEGMENTS_OVERLAP": "Low",
 }
 TAG_ORDER = list(SEVERITY) + ["CODE_AMBIGUOUS_ELSEWHERE"]
 RANK = {"High": 0, "Medium": 1, "Low": 2, "None": 3}
+
+# Issue 10. Coding scheme designators DICOM has retired, and what replaces
+# them. The replacement is NOT a rename: an SRT code and its SCT equivalent
+# have different CodeValues (T-62000 -> 10200004), so swapping the designator
+# alone produces a code that does not exist. dciodvfy reports these too, as a
+# Warning; this check is here because it runs on the BigQuery and DICOMweb
+# paths, where dciodvfy cannot.
+RETIRED_SCHEMES = {
+    "SRT": "SCT",
+    "SNM3": "SCT",
+    "SNM": "SCT",
+    "99SDM": "SCT",
+}
+
+# The code sequences the per-segment table carries a designator for.
+CODE_SEQUENCES = [
+    "AnatomicRegion",
+    "AnatomicRegionModifier",
+    "SegmentedPropertyCategory",
+    "SegmentedPropertyType",
+    "SegmentedPropertyTypeModifier",
+]
 
 # Type 1 in the Segment Description Macro, DICOM PS3.3 Table C.8.20-4.
 TYPE1 = [
@@ -217,6 +246,67 @@ def malformed(rows):
         )
         findings.append(finding)
     return findings
+
+
+# ---------------------------------------------------------------------------
+# Issue 10 - retired coding scheme designator. Computed.
+# ---------------------------------------------------------------------------
+
+
+def retired_scheme(rows):
+    """Segments carrying a code under a designator DICOM has retired.
+
+    Reported per segment, listing every sequence affected, because a producer
+    that uses SRT in one sequence normally uses it in all of them and the fix
+    is one change to the producer, not one per sequence.
+    """
+    findings = []
+    for row in rows:
+        affected = []
+        for prefix in CODE_SEQUENCES:
+            scheme = row.get(f"{prefix}CodingSchemeDesignator", "")
+            if scheme in RETIRED_SCHEMES and row.get(f"{prefix}CodeValue", ""):
+                affected.append(
+                    f"{prefix}CodeSequence={scheme}:"
+                    f"{row[f'{prefix}CodeValue']}"
+                )
+        if not affected:
+            continue
+        schemes = sorted({a.split("=")[1].split(":")[0] for a in affected})
+        finding = key(row)
+        finding.update({
+            "SOPInstanceUID": row["SOPInstanceUID"],
+            "retiredSchemes": ", ".join(schemes),
+            "replacementScheme": ", ".join(
+                sorted({RETIRED_SCHEMES[s] for s in schemes})),
+            "affectedSequences": "; ".join(affected),
+            "SeriesDescription": row["SeriesDescription"],
+        })
+        findings.append(finding)
+    return findings
+
+
+# ---------------------------------------------------------------------------
+# Issue 9 - IOD conformance, from dciodvfy. Read, not computed here: the
+# validator needs the files, which the BigQuery and DICOMweb paths do not have.
+# ---------------------------------------------------------------------------
+
+
+def iod_tags(path):
+    """issue9_iod_validation.csv -> SeriesInstanceUID -> {tag: message count}.
+
+    A series inherits IOD_ERROR if any of its objects drew a dciodvfy Error,
+    IOD_WARNING if any drew a Warning. Retired coding schemes are deliberately
+    NOT taken from here: issue 10 computes them from the per-segment table, so
+    the tag means the same thing on all three access paths.
+    """
+    tags = defaultdict(Counter)
+    for row in load(path):
+        if row["messageClass"] == "DEPRECATED_CODING_SCHEME":
+            continue
+        tag = "IOD_ERROR" if row["dciodvfySeverity"] == "Error" else "IOD_WARNING"
+        tags[row["SeriesInstanceUID"]][tag] += 1
+    return tags
 
 
 # ---------------------------------------------------------------------------
@@ -411,7 +501,8 @@ def curated(rows, review_csv):
 # ---------------------------------------------------------------------------
 
 
-def triage(rows, ambiguous, cosmetic, entire, verdicts, tracking):
+def triage(rows, ambiguous, cosmetic, entire, verdicts, tracking,
+           iod=None):
     ambiguous_tracking = {
         f["TrackingUID"] for f in tracking if f["sharingPattern"] == "WITHIN_STUDY"
     }
@@ -475,6 +566,10 @@ def triage(rows, ambiguous, cosmetic, entire, verdicts, tracking):
                 counts["ENTIRE_CODE_FLAVOUR"] += 1
             if any(not row[column] for column, _ in TYPE1):
                 counts["MALFORMED_SEGMENT"] += 1
+            if any(row.get(f"{prefix}CodingSchemeDesignator", "") in RETIRED_SCHEMES
+                   and row.get(f"{prefix}CodeValue", "")
+                   for prefix in CODE_SEQUENCES):
+                counts["RETIRED_CODING_SCHEME"] += 1
             if row["TrackingUID"] in ambiguous_tracking:
                 counts["TRACKINGUID_AMBIGUOUS"] += 1
             if row["TrackingUID"] in cross_patient:
@@ -484,6 +579,10 @@ def triage(rows, ambiguous, cosmetic, entire, verdicts, tracking):
                 counts["TYPE_REPEATS_CATEGORY"] += 1
             if not row["SegmentsOverlap"]:
                 counts["NO_SEGMENTS_OVERLAP"] += 1
+
+        # Issue 9 is per OBJECT, not per segment, so it joins at the series.
+        for tag, count in (iod or {}).get(series, {}).items():
+            counts[tag] += count
 
         tags = [t for t in TAG_ORDER if counts[t]]
         severities = [SEVERITY[t] for t in tags if t in SEVERITY]
@@ -533,6 +632,12 @@ def main():
     )
     parser.add_argument(
         "--review", help="curated verdict CSV; enables issues 1 and 3"
+    )
+    parser.add_argument(
+        "--iod",
+        help="issue9_iod_validation.csv from dciodvfy_check.py; folds the IOD "
+        "validator's verdict into the triage list. Local files only - the "
+        "validator needs the objects, not a metadata table.",
     )
     parser.add_argument(
         "--include-background",
@@ -614,6 +719,33 @@ def main():
         if not patterns[pattern]:
             print(f"           ok: {note}")
 
+    ret = retired_scheme(rows)
+    write(outdir, "issue10_retired_coding_scheme.csv", ret,
+          ["PatientID", "StudyInstanceUID", "SeriesInstanceUID", "SOPInstanceUID",
+           "SegmentNumber", "SegmentLabel", "retiredSchemes", "replacementScheme",
+           "affectedSequences", "SeriesDescription", "viewer_url"])
+    if ret:
+        schemes = Counter(f["retiredSchemes"] for f in ret)
+        print(f"Issue 10 retired scheme   {len(ret):>6} segments  "
+              + ", ".join(f"{k}={v}" for k, v in schemes.most_common()))
+        print("           the CodeValues change too - a designator swap alone "
+              "invents codes")
+    else:
+        print("Issue 10 retired scheme        0 segments  ok: no SRT/SNM3 codes")
+
+    # ---- read from the IOD validator, if it was run
+    iod = None
+    if args.iod:
+        iod = iod_tags(args.iod)
+        messages = load(args.iod)
+        errors = sum(1 for m in messages if m["dciodvfySeverity"] == "Error")
+        print(f"Issue 9  IOD validation   {errors:>6} errors, "
+              f"{len(messages) - errors} warnings over {len(iod)} series "
+              f"({args.iod})")
+    else:
+        print("Issue 9  skipped - run dciodvfy_check.py and pass --iod "
+              "(local files only)")
+
     # ---- needs the FSN lookup
     entire = {}
     if args.codes:
@@ -652,7 +784,7 @@ def main():
               "(see references/terminology.md)")
 
     # ---- roll-up
-    series = triage(rows, ambiguous, cosmetic, entire, verdicts, track)
+    series = triage(rows, ambiguous, cosmetic, entire, verdicts, track, iod)
     path = write(outdir, "series_triage.csv", series,
                  ["PatientID", "StudyInstanceUID", "SeriesInstanceUID", "issues",
                   "worstSeverity", "segmentCount", "segmentsNeedingRecode",

@@ -1,5 +1,52 @@
 # Changelog
 
+## 1.2.0 — 2026-09-15
+
+The review now validates the objects, not only their metadata table.
+
+- **Issue 9 — IOD conformance, via `dciodvfy`.** `scripts/dciodvfy_check.py` runs
+  David Clunie's validator over a delivery (`pip install dicom3tools`) and normalises
+  its output into the per-segment shape everything else uses, so a Type 1 violation
+  lands on a segment in the triage list rather than in a log. Three CSVs: one row per
+  message, one row per distinct defect (what the report quotes), one row per object.
+  `seg_checks.py --iod` folds the verdict in as `IOD_ERROR` / `IOD_WARNING`.
+- **`-new`, `-allpffgitems` and `-filename` are always passed**, and the reasons are
+  documented because each is a way to miss findings. `-new` supplies the attribute
+  path that makes segment attribution possible at all. Without `-allpffgitems`,
+  dciodvfy checks only the **first** per-frame functional group item — verified by
+  breaking the last frame of a three-frame object and getting a silent pass. It costs
+  about 10× (~4 ms per frame item), which is why the runner parallelises across files.
+- **The exit status is documented as unusable**: 1 means "IOD errors *or* unreadable
+  file", 0 means "clean *or* warnings only", and everything goes to stderr.
+- **A boundary statement, in SKILL.md and the catalogue.** dciodvfy validates
+  structure, not semantics — confirmed by planting nonexistent codes in
+  `AnatomicRegionSequence` and `SegmentedPropertyTypeCodeSequence` and getting silence.
+  Issues 1, 2, 3 and 8 are outside its reach, so a clean run is not a statement about
+  the coding. Nothing it reports is ever High: a message *is* the detection.
+- **The skill is no longer metadata-only, and now says so.** dciodvfy reads `PixelData`
+  and checks its length against Rows × Columns × Frames × BitsAllocated, catching a
+  truncated object or one claiming more frames than it carries — which every other
+  check in the review passes. Class `BAD_VALUE_LENGTH`. The description, the overview
+  and the scope section are reworded: the boundary is the **voxel values**, not the
+  pixel data. Nothing here still interprets what was segmented.
+- **Issue 10 — retired coding scheme designators** (`SRT`, `SNM3`, `SNM`, `99SDM`).
+  dciodvfy reports these as a Warning; the review promotes them, because
+  `lookup_codes.py` skips any non-`SCT` scheme and `dcmterm.py` does not count `SRT` as
+  private. A batch coded in SRT therefore reports near-total coverage gap and zero
+  verified codes, which looks like exotic anatomy and is not. Computed from the
+  per-segment table, so unlike issue 9 it runs on all three access paths —
+  `sql/13_retired_coding_scheme.sql` is the BigQuery form. The repair is a re-coding,
+  not a rename: `T-62000` becomes `10200004`.
+- **What each access path can and cannot check** is now stated in all three access
+  references and in `sql/12`: a triage list built on BigQuery carries no IOD tag, and
+  that silence is "not checked", not "conformant".
+- Report provenance extends to the validator build alongside the two terminology
+  sources.
+- 24 more tests, including the `dciodvfy -new` grammar pinned against captured real
+  output — so a dicom3tools build that changes the message format fails the suite
+  rather than silently parsing to nothing. The suite still needs neither network nor
+  dicom3tools.
+
 ## 1.1.0 — 2026-09-15
 
 Checking a batch against the code set DICOM itself uses now needs nothing but a
