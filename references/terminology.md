@@ -216,26 +216,27 @@ without one need a decision and may also be at the wrong granularity.
 
 Two ways to say "left":
 
-- **Pre-coordinated** — one code that already names the side (`80248007` left breast).
+- **Pre-coordinated** — one code that already names the side (`80248007`
+  "Left breast structure", used in DICOM as Code Meaning "Left breast").
 - **Post-coordinated** — a general anatomic code plus a laterality modifier:
-  - `AnatomicRegionModifierSequence` (0008,2220), baseline CID 2
-  - `SegmentedPropertyTypeModifierCodeSequence` (0062,0011)
-  - laterality from **CID 244**: `7771000` Left, `24028007` Right, `66459002`
-    Unilateral, `51440002` Bilateral
+  - `AnatomicRegionModifierSequence` (0008,2220) — modifies the region;
+    **Defined** CID 2 unless the macro invocation overrides
+  - `SegmentedPropertyTypeModifierCodeSequence` (0062,0011) — modifies the
+    segment's property type under (0062,000F)
+  - laterality from **CID 244**: `7771000` Left, `24028007` Right,
+    `66459002` Unilateral, `51440002` "Right and left" (PS3.3 §10.5's
+    correspondence table labels the same code "Bilateral")
 
-Pre-coordination alone causes both laterality failure modes: where no side-specific
-code exists the laterality falls into free text (`UNCODED`), and where two similar
-codes exist, picking the wrong one flips the side silently (`INVERTED`).
+Pre-coordination alone causes both laterality failure modes: where no
+side-specific code exists the laterality falls into free text (`UNCODED`),
+and where two similar codes exist, picking the wrong one flips the side
+silently (`INVERTED`).
 
-**Check which mechanism the batch uses before reporting anything.** A pre-coordinating
-batch populates neither modifier sequence — often the attributes are absent from the
-export schema entirely. A post-coordinating one may carry Left / Right / "Right and
-left" in either sequence. They are different attributes and a batch may use either.
-
-State the preference as a practical argument. **PS3.3 §10.5** defines the modifier
-mechanism and the laterality context groups but does not require post- over
-pre-coordination, and a report that claims a conformance violation here will be
-correctly rejected.
+State the preference as a practical argument. **PS3.3 §10.5** defines the
+modifier mechanism and the laterality context groups but does not require
+post- over pre-coordination; PS3.16 §6.2.4 permits post-coordination
+without mandating it, and PS3.16 Table L-5 explicitly treats laterality
+already pre-coordinated into a concept as a legitimate case.
 
 ## Codes with no standard equivalent
 
