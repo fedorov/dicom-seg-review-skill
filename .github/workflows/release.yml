@@ -1,0 +1,67 @@
+name: Create Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Extract version from tag
+        id: version
+        run: echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+      - name: Check SKILL.md metadata version matches the tag
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          SKILL_VERSION=$(awk '/^metadata:/ { in_meta = 1; next }
+                               in_meta && /^[^ ]/ { exit }
+                               in_meta && $1 == "version:" { gsub(/"/, "", $2); print $2; exit }' SKILL.md)
+          if [ "$SKILL_VERSION" != "$VERSION" ]; then
+            echo "Error: SKILL.md metadata.version is '$SKILL_VERSION', tag is 'v$VERSION'"
+            exit 1
+          fi
+          echo "SKILL.md metadata.version matches the tag: $VERSION"
+
+      - name: Extract CHANGELOG entry for release notes
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          # Print the body of the "## VERSION — ..." section, up to the next "## " heading.
+          awk -v ver="$VERSION" '
+            $1 == "##" && $2 == ver { found = 1; next }
+            found && $1 == "##" { exit }
+            found { print }
+          ' CHANGELOG.md | sed '/./,$!d' > release_notes.md
+          if [ ! -s release_notes.md ]; then
+            echo "Error: CHANGELOG.md does not contain an entry for version $VERSION"
+            echo "Please add a section like: ## $VERSION — $(date +%Y-%m-%d)"
+            exit 1
+          fi
+          echo "Extracted release notes for $VERSION:"
+          cat release_notes.md
+
+      - name: Create skill zip
+        run: |
+          zip -r dicom-seg-review-${{ steps.version.outputs.version }}.zip \
+            SKILL.md \
+            references/ \
+            scripts/ \
+            templates/ \
+            requirements.txt \
+            -x '*__pycache__*'
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          name: v${{ steps.version.outputs.version }}
+          body_path: release_notes.md
+          generate_release_notes: true
+          files: dicom-seg-review-${{ steps.version.outputs.version }}.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

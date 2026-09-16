@@ -9,3 +9,6 @@ __pycache__/
 findings/
 seg_attributes.csv
 codes.csv
+
+# release packages built by .github/workflows/release.yml
+*.zip
