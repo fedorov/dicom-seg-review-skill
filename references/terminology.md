@@ -1,8 +1,32 @@
 # Judging the codes
 
-Step 4–5 of the workflow: turning "these codes are suspicious" into a verdict per
+Step 4 of the workflow: turning "these codes are suspicious" into a verdict per
 `(CodeValue, CodeMeaning)` pair. This is the part no query does for you, and it is
 where the review earns its keep.
+
+## Which sequence carries the anatomy
+
+Three sequences of the Segment Description Macro carry a segment's meaning, and
+every terminology check here reads all three:
+
+| Sequence | Tag | Type | Baseline CID |
+|---|---|---|---|
+| `SegmentedPropertyCategoryCodeSequence` | (0062,0003) | 1 | 7150 |
+| `SegmentedPropertyTypeCodeSequence` | (0062,000F) | 1 | 7151 |
+| `AnatomicRegionSequence` | (0008,2218) | 3 | 4 |
+
+Because the region is optional and the type is required, most organ-segmentation
+deliveries put the organ in the **type** sequence and omit the region. A review
+that resolves the region alone then resolves nothing and reports the batch clean.
+`seg_checks.py` and `seg_attributes.py` both print how many segments populate
+each sequence; open the report with that fact, and expect the type column to be
+where issues 1, 2, 3 and 8 land. `lookup_codes.py` and `dcmterm.py coverage` read
+all three by default and record `codeSequences` per code; `--column` narrows them.
+`seg_checks.py --sequences` does the same for the checks themselves.
+
+Category and type also have a check of their own, issue 15: whether each is in its
+baseline context group, and whether the type is in the CID that its own category
+names. `dcmterm.py property` runs it; see `references/issue-catalogue.md`.
 
 ## Two sources, and why you need both
 
@@ -90,7 +114,8 @@ rather than noise to normalise away.
 python scripts/lookup_codes.py seg_attributes.csv -o findings/codes.csv
 ```
 
-One row per distinct `(CodingSchemeDesignator, CodeValue)` with:
+One row per distinct `(CodingSchemeDesignator, CodeValue)` across the region, type
+and category sequences — a code used in two of them is looked up once — with:
 
 | Column | |
 |---|---|
@@ -98,8 +123,9 @@ One row per distinct `(CodingSchemeDesignator, CodeValue)` with:
 | `found` | FALSE means the code does not exist — a finding in itself |
 | `active` | FALSE means a **retired** concept; DICOM objects should not use one |
 | `isEntireFlavour` | `fsn` begins `Entire ` — issue 8 candidate, computed |
+| `codeSequences` | Which sequences use the code, semicolon-separated |
 | `meaningsInBatch` | Every distinct `CodeMeaning` the batch records, pipe-separated |
-| `distinctMeanings`, `segments`, `series` | Scale |
+| `distinctMeanings`, `segments`, `series` | Scale; `segments` counts one per sequence that carries the code |
 
 Sort by `segments` descending and work down — a handful of codes usually accounts for
 most of the damage.
@@ -145,6 +171,36 @@ report must say so rather than presenting the empty result as a clean one.
 
 **Rate-limit**: the script sleeps between requests. A few hundred codes takes a couple
 of minutes; do not parallelise it into a public server.
+
+## The review table
+
+Verdicts live in **one** CSV, passed to `seg_checks.py --review`. Its header is a
+contract: the join is on `CodeValue`, `CodingSchemeDesignator` and
+`meaningRecorded`, compared verbatim, and a header that does not match would join
+nothing. The script refuses a table missing a required column and names this
+header; `templates/review.csv` is a copy to start from, and
+`sql/04_code_review_template.sql` is the same table for BigQuery.
+
+```
+CodeValue,CodingSchemeDesignator,codeSequence,meaningRecorded,codeActuallyMeans,verdict,reviewSource,issue
+10200004,SCT,,Large bowel,liver,WRONG_ANATOMY,dcmterm,1
+110634007,SCT,AnatomicRegion,Left adnexa,right uterine adnexa,INVERTED,tx.fhir.org,3
+```
+
+| Column | Required | |
+|---|---|---|
+| `CodeValue` | yes | |
+| `CodingSchemeDesignator` | | `SCT` unless the batch says otherwise |
+| `codeSequence` | | `AnatomicRegion`, `SegmentedPropertyType` or `SegmentedPropertyCategory` to scope the verdict to one sequence; **empty applies it wherever the pairing appears**, which is the usual case |
+| `meaningRecorded` | yes | the `CodeMeaning` exactly as the batch records it |
+| `codeActuallyMeans` | | what the code denotes, from the FSN |
+| `verdict` | yes | one of the five below |
+| `reviewSource` | | `dcmterm`, `tx.fhir.org` or `manual` |
+| `issue` | | 1 or 3; informational in the CSV, used by the SQL |
+
+`seg_checks.py` reports how many review rows matched no segment. A non-zero count
+is a stale verdict or a `meaningRecorded` that differs from the table by a
+character — fix it, or the finding silently disappears from the triage list.
 
 ## Deciding a verdict
 

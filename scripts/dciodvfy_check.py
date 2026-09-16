@@ -56,6 +56,10 @@ MESSAGE_CLASSES = [
     # SEG this catches a truncated object, or one claiming more frames than it
     # carries - which nothing else in this review would notice.
     (r"has incorrect value length", "BAD_VALUE_LENGTH"),
+    # Issue 16 as dciodvfy sees it, with the item ORDER the per-segment table
+    # cannot recover: seg_checks.py checks that the numbers are 1..n, this
+    # checks that they arrive in that order too.
+    (r"SegmentNumber not monotonically increasing", "SEGMENT_NUMBER_NOT_SEQUENTIAL"),
     (r"Bad Pixel Image|Bad PixelRepresentation", "BAD_PIXEL_ENCODING"),
     (r"Bad Value Length", "BAD_VALUE_LENGTH"),
     (r"Bad Sequence number of Items", "BAD_SEQUENCE_ITEM_COUNT"),
@@ -151,6 +155,18 @@ def split_path(path):
     return name, tag, items
 
 
+# A build that predates a flag prints this and validates NOTHING. Treating that
+# output as "no messages" would report every object clean, which is the one
+# failure this runner must never have - so it is a hard stop, not a warning.
+UNSUPPORTED_OPTION = re.compile(r"^(?P<option>-\S+): unrecognized option\s*$", re.M)
+
+
+def unsupported_option(text):
+    """The option a dciodvfy build rejected, or "" if it accepted them all."""
+    match = UNSUPPORTED_OPTION.search(text or "")
+    return match.group("option") if match else ""
+
+
 def parse_output(text):
     """dciodvfy -new output -> (iod, [message dicts]).
 
@@ -213,11 +229,32 @@ def parse_output(text):
 # ---------------------------------------------------------------------------
 
 
+def _installed_beside_interpreter(binary):
+    """True when `binary` is the one `pip install dicom3tools` put into this
+    Python's environment, as opposed to some older build found on PATH."""
+    try:
+        return Path(binary).resolve().is_relative_to(Path(sys.prefix).resolve())
+    except (OSError, ValueError):
+        return False
+
+
 def find_binary(explicit=None):
-    binary = explicit or shutil.which("dciodvfy")
+    """The dciodvfy to run: the caller's choice, else the one installed beside
+    this interpreter, else the first on PATH.
+
+    The order matters. `pip install dicom3tools` puts a current build next to
+    the interpreter, but PATH can carry an older dciodvfy first, and an older
+    build rejects -allpffgitems and validates nothing.
+    """
+    if explicit:
+        return explicit
+    beside = Path(sys.executable).parent / "dciodvfy"
+    if beside.exists():
+        return str(beside)
+    binary = shutil.which("dciodvfy")
     if not binary:
         raise SystemExit(
-            "dciodvfy not on PATH:\n  pip install dicom3tools\n"
+            "dciodvfy not found:\n  pip install dicom3tools\n"
             "or pass --dciodvfy /path/to/dciodvfy"
         )
     return binary
@@ -225,13 +262,20 @@ def find_binary(explicit=None):
 
 def tool_provenance(binary):
     """The line to quote in the report. Both terminology and validator
-    versions belong there - see references/reporting.md."""
-    try:
-        from importlib.metadata import version
+    versions belong there - see references/reporting.md.
 
-        return f"dicom3tools {version('dicom3tools')} ({binary})"
-    except Exception:
-        return f"dicom3tools, build unknown ({binary})"
+    The pip package's version describes only the binary it installed; a
+    dciodvfy found elsewhere on PATH is some other build, and saying so beats
+    quoting a version that is not its own.
+    """
+    if _installed_beside_interpreter(binary):
+        try:
+            from importlib.metadata import version
+
+            return f"dicom3tools {version('dicom3tools')} ({binary})"
+        except Exception:
+            pass
+    return f"dicom3tools, build unknown - not the pip-installed one ({binary})"
 
 
 def run_one(binary, path, timeout):
@@ -245,7 +289,31 @@ def run_one(binary, path, timeout):
         return None, f"dciodvfy timed out after {timeout}s"
     # Exit status is NOT a pass/fail signal: 1 means "errors OR the file could
     # not be read", 0 means "clean OR warnings only". The output is the signal.
-    return (proc.stderr or "") + (proc.stdout or ""), None
+    text = (proc.stderr or "") + (proc.stdout or "")
+    option = unsupported_option(text)
+    if option:
+        return None, (f"this dciodvfy build does not know {option}; it printed its "
+                      "usage and validated nothing")
+    return text, None
+
+
+def require_current_build(binary, probe_path, timeout):
+    """Run dciodvfy once and stop if it rejects a flag.
+
+    Every file would fail the same way, and the per-file FAILED rows would
+    then sit in a CSV a reader may never open. A build that cannot run the
+    check is a reason not to produce a triage list, not a finding in it.
+    """
+    _, failure = run_one(binary, probe_path, timeout)
+    if failure and "does not know" in failure:
+        raise SystemExit(
+            f"{failure}\n  binary: {binary}\n"
+            "  Without -allpffgitems dciodvfy checks only the first per-frame "
+            "item, so this runner refuses to\n  report on that basis. Install a "
+            "current build (pip install dicom3tools puts dciodvfy beside this\n"
+            "  interpreter, which is where the runner looks first) or pass "
+            "--dciodvfy /path/to/a/current/one."
+        )
 
 
 def segment_index(dataset):
@@ -460,6 +528,7 @@ def main():
     outdir.mkdir(parents=True, exist_ok=True)
 
     print(tool_provenance(binary))
+    require_current_build(binary, targets[0][0], args.timeout)
     print(f"{counts['files']} files, {counts['seg']} segmentation objects, "
           f"{counts['not_seg']} not SEG, {counts['not_dicom']} not DICOM, "
           f"{counts['unreadable']} unreadable")

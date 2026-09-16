@@ -10,14 +10,21 @@ dependency. `scripts/dciodvfy_check.py` adds the IOD validator, which needs
 the pixel data and the file meta group.
 
 ```bash
-pip install 'pydicom>=3.0' dicom3tools
-python scripts/seg_attributes.py --files /path/to/delivery -o seg_attributes.csv
+pip install -r requirements.txt          # pydicom, pyarrow, dicom3tools, dicomweb-client
+python scripts/seg_attributes.py --files /path/to/delivery --resolve-referenced -o seg_attributes.csv
 python scripts/dciodvfy_check.py --files /path/to/delivery -o findings/
 python scripts/seg_encoding.py   --files /path/to/delivery -o findings/
+python scripts/dcmterm.py property seg_attributes.csv -o findings/issue15_property_context_group.csv
 python scripts/seg_checks.py seg_attributes.csv \
     --iod findings/issue9_iod_validation.csv \
-    --encoding findings/encoding_per_object.csv --outdir findings/
+    --encoding findings/encoding_per_object.csv \
+    --property findings/issue15_property_context_group.csv --outdir findings/
 ```
+
+To see every output once on a delivery whose defects are known,
+`python scripts/make_fixture.py /tmp/seg-fixture` writes five small synthetic
+files — two CT slices and three segmentations — and prints the commands above with
+that directory filled in.
 
 **This is the only path that can run issues 9, 11 and 12.** `dciodvfy` validates an
 object against the Segmentation IOD; the empty-frame check needs the voxels; the
@@ -107,7 +114,7 @@ looks at the voxels for their own sake. Detail and the DICOM references are in
   its range is zero, which is an integer mask over a slice of `PixelData`. Native
   encodings are read directly; Deflated Image Frame Compression
   (`1.2.840.10008.1.2.8.1`) is un-deflated here, fragment by fragment, because
-  pydicom 3.0.1 does not recognise that UID at all. RLE and the JPEG family are
+  pydicom 3.0.x (checked through 3.0.2) does not recognise that UID at all. RLE and the JPEG family are
   reported as `NOT_DECODED` rather than guessed at — read the decode-status counts
   before quoting an empty-frame number as complete.
 - **`--workers` parallelises across files**, `--limit N` scans a sample first.
@@ -122,12 +129,14 @@ size beside the delivered one — that number is the argument a producer can act
 Read the printed decode-status block. An object whose pixel data could not be read is
 not an object with no empty frames.
 
-## Colour and algorithm identification
+## Colour, algorithm identification, context groups, segment numbers
 
-Issues 13 and 14 need nothing extra here: `seg_attributes.py` extracts
-`RecommendedDisplayCIELabValue`, `SegmentAlgorithmName` and the whole
-`SegmentationAlgorithmIdentificationSequence`, and `seg_checks.py` runs both checks on
-every invocation. They run identically on all three access paths.
+Issues 13, 14 and 16 need nothing extra here: `seg_attributes.py` extracts
+`RecommendedDisplayCIELabValue`, `SegmentAlgorithmName`, the whole
+`SegmentationAlgorithmIdentificationSequence` and every segment number, and
+`seg_checks.py` runs the checks on every invocation. Issue 15 needs one more
+command, `dcmterm.py property`, which reads the public dcmterms tables. All four run
+identically on all three access paths.
 
 The one local-files detail: `PhotometricInterpretation` is extracted because issue 13
 needs it. PS3.3 C.8.20.2 forbids `RecommendedDisplayCIELabValue` on a LABELMAP object
@@ -139,10 +148,14 @@ without it.
 - **Collection / project membership.** Not in the object unless `ClinicalTrial*`
   attributes are populated. Supply it with `--collection <name>` if the whole delivery
   is one collection, or join it on afterwards.
-- **The referenced image series' `Modality` and `BodyPartExamined`**, unless the
-  producer copied them into `ReferencedSeriesSequence`. If the referenced image series
-  are in the same directory tree, `--resolve-referenced` reads one instance of each to
-  fill them in.
+- **The referenced image series' `Modality`, `BodyPartExamined` and
+  `FrameOfReferenceUID`**, unless the producer copied the first two into
+  `ReferencedSeriesSequence`. If the referenced image series are in the same directory
+  tree, `--resolve-referenced` reads one instance of each to fill them in — and
+  issue 17 (Frame of Reference, dangling references) runs only then. A series not
+  found in the tree is recorded as `referencedSeriesFound = False`, which is the
+  dangling reference; without the flag the column stays empty and the check is
+  silent.
 - **A viewer URL**, unless you pass `--viewer-url` with a pattern. Findings without
   clickable examples are markedly less useful to whoever has to act on them — supply
   the pattern for wherever the data will end up, even if it is not ingested yet.

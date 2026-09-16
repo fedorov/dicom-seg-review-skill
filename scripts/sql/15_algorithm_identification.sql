@@ -129,7 +129,7 @@ SELECT
   ManufacturerModelName,
   # description:
   # First value of DICOM SoftwareVersions. Same caveat.
-  SoftwareVersion,
+  SoftwareVersions,
   # description:
   # DICOM SeriesDescription of the segmentation series
   SeriesDescription,

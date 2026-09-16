@@ -15,6 +15,13 @@
 # Keyed on the PAIRING, not the code: the same code can be correct under one
 # CodeMeaning and wrong under another, which is exactly what 02 surfaces.
 #
+# `codeSequence` scopes a verdict to one of the three code sequences the checks
+# judge - 'AnatomicRegion', 'SegmentedPropertyType' or
+# 'SegmentedPropertyCategory'. NULL means the verdict applies whichever
+# sequence carries the pairing, which is the usual case. The CSV form of this
+# table that scripts/seg_checks.py --review reads has the same columns; its
+# header is in templates/review.csv and references/terminology.md.
+#
 # THIS WILL NOT FOLLOW A NEW DELIVERY. It encodes judgements about the codes one
 # batch happened to use. Re-derive it by running 02_ambiguous_code.sql and
 # 03_codes_not_in_dcmterm.sql (or scripts/dcmterm.py coverage) against the new
@@ -43,11 +50,13 @@ SELECT * FROM UNNEST([
       1 AS issue,
       'SCT' AS CodingSchemeDesignator,
       '10200004' AS CodeValue,
+      # NULL: applies in whichever sequence the pairing appears.
+      CAST(NULL AS STRING) AS codeSequence,
       'liver' AS codeActuallyMeans,
       'Large bowel' AS meaningRecorded,
       'WRONG_ANATOMY' AS verdict,
       # 'dcmterm' means the code set DICOM's own context groups use - see
       # scripts/dcmterm.py, which prints the edition it checked against.
       'dcmterm' AS reviewSource),
-    (3, 'SCT', '110634007', 'right uterine adnexa', 'Left adnexa',
-     'INVERTED', 'tx.fhir.org')])
+    (3, 'SCT', '110634007', 'AnatomicRegion', 'right uterine adnexa',
+     'Left adnexa', 'INVERTED', 'tx.fhir.org')])

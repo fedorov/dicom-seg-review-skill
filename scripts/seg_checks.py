@@ -10,17 +10,25 @@ Usage:
   python seg_checks.py seg_attributes.csv --outdir findings/
   python seg_checks.py seg_attributes.csv --outdir findings/ \\
       --codes findings/codes.csv --review review.csv \\
+      --property findings/issue15_property_context_group.csv \\
       --iod findings/issue9_iod_validation.csv \\
       --encoding findings/encoding_per_object.csv
 
-Computed checks (issues 2, 4, 5, 6, 7, 10, 13, 14) need nothing but the data
-and will follow a new delivery. Issue 8 needs the fully specified names from
-lookup_codes.py. Issue 9 is the IOD validator's verdict, read from
-dciodvfy_check.py via --iod, and issues 11 and 12 come from seg_encoding.py
-via --encoding; all three need the files, so they are unavailable on the
-BigQuery and DICOMweb paths. Issues 1 and 3 are curated: they need --review,
-and a review built against an earlier batch is STALE until re-derived. See
-SKILL.md, "Core rule".
+Computed checks (issues 2, 4, 5, 6, 7, 10, 13, 14, 16, 17) need nothing but
+the data and will follow a new delivery. Issue 8 needs the fully specified
+names from lookup_codes.py (--codes); issue 15 needs the context-group
+membership that dcmterm.py property computes (--property). Issue 9 is the IOD
+validator's verdict, read from dciodvfy_check.py via --iod, and issues 11 and
+12 come from seg_encoding.py via --encoding; those three need the files, so
+they are unavailable on the BigQuery and DICOMweb paths. Issues 1 and 3 are
+curated: they need --review, and a review built against an earlier batch is
+STALE until re-derived. See SKILL.md, "Core rule".
+
+The terminology checks - issues 1, 2, 3 and 8 - run over the anatomic region,
+the segmented property type AND the segmented property category. The region is
+Type 3 and the other two are Type 1, so a batch that carries the organ in the
+type sequence and no region at all is conformant and common; a review that
+read the region alone would report it clean.
 """
 
 import argparse
@@ -54,6 +62,11 @@ SEVERITY = {
     "COLOR_NOT_PERMITTED": "Medium",
     "COLOR_MALFORMED": "Medium",
     "ALGORITHM_NAME_MISSING": "Medium",
+    "TYPE_OUTSIDE_CATEGORY": "Medium",
+    "SEGMENT_NUMBER_DUPLICATE": "Medium",
+    "SEGMENT_NUMBER_NOT_SEQUENTIAL": "Medium",
+    "FRAME_OF_REFERENCE_MISMATCH": "Medium",
+    "REFERENCED_SERIES_MISSING": "Medium",
     "COSMETIC_VARIANT": "Low",
     "IOD_WARNING": "Low",
     "CODE_MEANING_SPELLING": "Low",
@@ -65,6 +78,8 @@ SEVERITY = {
     "COLOR_INCONSISTENT": "Low",
     "COLOR_ABSENT": "Low",
     "ALGORITHM_UNIDENTIFIED": "Low",
+    "CATEGORY_NOT_IN_CID": "Low",
+    "TYPE_NOT_IN_CID": "Low",
 }
 TAG_ORDER = list(SEVERITY) + ["CODE_AMBIGUOUS_ELSEWHERE"]
 RANK = {"High": 0, "Medium": 1, "Low": 2, "None": 3}
@@ -117,10 +132,55 @@ TYPE1 = [
     ("SegmentAlgorithmType", "SegmentAlgorithmType"),
 ]
 
+# The code sequences whose MEANING the terminology checks judge - issues 1, 2,
+# 3 and 8. The anatomic region is Type 3 in the Segment Description Macro;
+# category and type are Type 1. A producer that puts the organ in the type
+# sequence and omits the region is therefore conformant, and common - most
+# organ-segmentation deliveries converted with dcmqi or highdicom look like
+# that - so a review that reads the region alone sees nothing on such a batch.
+# Order matters only for the reports: region first, because when it IS
+# populated it is the finer statement of location.
+JUDGED_CODE_SEQUENCES = [
+    "AnatomicRegion",
+    "SegmentedPropertyType",
+    "SegmentedPropertyCategory",
+]
+
+# The curated review table (--review). Header contract, documented in
+# references/terminology.md with a copy in templates/review.csv. The join is on
+# (CodeValue, CodingSchemeDesignator, meaningRecorded) and, when a row names
+# one, codeSequence; an empty codeSequence means "whichever sequence carries
+# this pairing". A header that does not match would join nothing and report
+# nothing - the worst failure a curated check can have - so it is checked
+# rather than trusted.
+REVIEW_COLUMNS = [
+    "CodeValue",
+    "CodingSchemeDesignator",
+    "codeSequence",
+    "meaningRecorded",
+    "codeActuallyMeans",
+    "verdict",
+    "reviewSource",
+    "issue",
+]
+REVIEW_REQUIRED = ("CodeValue", "meaningRecorded", "verdict")
+VERDICTS = {"WRONG_ANATOMY", "NARROWER_OR_BROADER", "SPELLING", "INVERTED", "UNCODED"}
+LATERALITY_VERDICTS = {"INVERTED", "UNCODED"}
+
 
 def load(path):
     with open(path, newline="") as handle:
         return list(csv.DictReader(handle))
+
+
+def truthy(value):
+    """A CSV boolean. The extractor writes "True"; a BigQuery CSV export writes
+    "true"; a hand-edited table may carry either. Case decides nothing here."""
+    return str(value or "").strip().lower() == "true"
+
+
+def falsy(value):
+    return str(value or "").strip().lower() == "false"
 
 
 def write(outdir, name, rows, columns):
@@ -176,77 +236,131 @@ def _same_anatomy_written_twice(a, b):
     return SequenceMatcher(None, left, right).ratio() >= 0.85
 
 
-def ambiguous_codes(rows):
-    meanings = defaultdict(Counter)
-    for row in rows:
-        code = row["AnatomicRegionCodeValue"]
-        if code:
-            meanings[code][row["AnatomicRegionCodeMeaning"]] += 1
+def _code_in(row, sequence):
+    """(CodingSchemeDesignator, CodeValue, CodeMeaning) of one code sequence."""
+    return (
+        row.get(f"{sequence}CodingSchemeDesignator", "") or "",
+        row.get(f"{sequence}CodeValue", "") or "",
+        row.get(f"{sequence}CodeMeaning", "") or "",
+    )
 
-    ambiguous = {c: m for c, m in meanings.items() if len(m) > 1}
-    # Dominant = most used, ties broken alphabetically, as in the SQL.
-    dominant = {
-        code: sorted(counter.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
-        for code, counter in ambiguous.items()
-    }
 
-    # A series that uses ONE code with two meanings by itself is the strongest
-    # evidence available, and does not depend on the rest of the population.
+def _self_inconsistent_series(rows, sequences):
+    """Series that use ONE code with two meanings by themselves - the strongest
+    evidence available, and independent of the rest of the population."""
     per_series = defaultdict(lambda: defaultdict(set))
     for row in rows:
-        if row["AnatomicRegionCodeValue"]:
-            per_series[row["SeriesInstanceUID"]][row["AnatomicRegionCodeValue"]].add(
-                row["AnatomicRegionCodeMeaning"]
-            )
-    self_inconsistent = {
+        for sequence in sequences:
+            _, code, meaning = _code_in(row, sequence)
+            if code:
+                per_series[row["SeriesInstanceUID"]][(sequence, code)].add(meaning)
+    return {
         series
         for series, codes in per_series.items()
         if any(len(m) > 1 for m in codes.values())
     }
 
+
+def ambiguous_codes(rows, sequences=None):
+    """Issue 2, over every judged code sequence.
+
+    Returns (findings, ambiguous, cosmetic). `ambiguous` and `cosmetic` are
+    keyed on (codeSequence, CodeValue): ambiguity is a property of a code AS
+    USED IN ONE ROLE, so a code that is the anatomic region on one segment and
+    the property type on another is judged in each role separately.
+    """
+    sequences = sequences or JUDGED_CODE_SEQUENCES
+    meanings = defaultdict(Counter)
+    for row in rows:
+        for sequence in sequences:
+            _, code, meaning = _code_in(row, sequence)
+            if code:
+                meanings[(sequence, code)][meaning] += 1
+
+    ambiguous = {k: m for k, m in meanings.items() if len(m) > 1}
+    # Dominant = most used, ties broken alphabetically, as in the SQL.
+    dominant = {
+        k: sorted(counter.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
+        for k, counter in ambiguous.items()
+    }
+    self_inconsistent = _self_inconsistent_series(rows, sequences)
+
     cosmetic = set()
-    for code, counter in ambiguous.items():
+    for k, counter in ambiguous.items():
         variants = list(counter)
         if all(
             _same_anatomy_written_twice(a, b)
             for i, a in enumerate(variants)
             for b in variants[i + 1 :]
         ):
-            cosmetic.add(code)
+            cosmetic.add(k)
 
     findings = []
     for row in rows:
-        code = row["AnatomicRegionCodeValue"]
-        if code not in ambiguous:
-            continue
-        if row["SeriesInstanceUID"] in self_inconsistent:
-            scope = "SELF_INCONSISTENT"
-        elif row["AnatomicRegionCodeMeaning"] != dominant[code]:
-            scope = "MINORITY_MEANING"
-        else:
-            scope = "DOMINANT_MEANING"
-        finding = key(row)
-        finding.update(
-            {
-                "AnatomicRegionCodeValue": code,
-                "AnatomicRegionCodeMeaning": row["AnatomicRegionCodeMeaning"],
-                "dominantMeaning": dominant[code],
-                "distinctMeanings": len(ambiguous[code]),
-                "scope": scope,
-                "cosmeticCandidate": code in cosmetic,
-            }
-        )
-        findings.append(finding)
+        for sequence in sequences:
+            scheme, code, meaning = _code_in(row, sequence)
+            k = (sequence, code)
+            if k not in ambiguous:
+                continue
+            if row["SeriesInstanceUID"] in self_inconsistent:
+                scope = "SELF_INCONSISTENT"
+            elif meaning != dominant[k]:
+                scope = "MINORITY_MEANING"
+            else:
+                scope = "DOMINANT_MEANING"
+            finding = key(row)
+            finding.update(
+                {
+                    "codeSequence": sequence,
+                    "CodingSchemeDesignator": scheme,
+                    "CodeValue": code,
+                    "CodeMeaning": meaning,
+                    "dominantMeaning": dominant[k],
+                    "distinctMeanings": len(ambiguous[k]),
+                    "scope": scope,
+                    "cosmeticCandidate": k in cosmetic,
+                }
+            )
+            findings.append(finding)
 
+    order = {sequence: i for i, sequence in enumerate(sequences)}
     findings.sort(
         key=lambda f: (
             {"SELF_INCONSISTENT": 0, "MINORITY_MEANING": 1}.get(f["scope"], 2),
             -f["distinctMeanings"],
-            f["AnatomicRegionCodeValue"],
+            f["CodeValue"],
+            order[f["codeSequence"]],
             f["PatientID"],
         )
     )
     return findings, ambiguous, cosmetic
+
+
+def code_sequence_summary(rows, sequences=None):
+    """Which code sequences this batch populates - step 1 of the workflow.
+
+    Category and type are Type 1 and the anatomic region Type 3, so which of
+    them carries the anatomy is a property of the producer, not of DICOM. The
+    terminology checks run over all three regardless, but the report has to
+    say where the anatomy lives, and a region column empty on most segments is
+    the first fact about a batch.
+    """
+    sequences = sequences or JUDGED_CODE_SEQUENCES
+    summary = []
+    for sequence in sequences:
+        coded = [_code_in(row, sequence) for row in rows]
+        coded = [c for c in coded if c[1]]
+        summary.append({
+            "codeSequence": sequence,
+            "segmentsWithCode": len(coded),
+            "segments": len(rows),
+            "distinctCodes": len({(scheme, code) for scheme, code, _ in coded}),
+            "distinctMeanings": len({meaning for _, _, meaning in coded}),
+            "schemes": ", ".join(
+                f"{scheme or '(none)'}={n}"
+                for scheme, n in Counter(c[0] for c in coded).most_common()),
+        })
+    return summary
 
 
 # ---------------------------------------------------------------------------
@@ -552,7 +666,7 @@ def write_palette_markdown(outdir, palette, swatch_dir="swatches"):
         name = entry["hex"].lstrip("#")
         triplet = cielab.parse(entry["RecommendedDisplayCIELabValue"])
         (swatches / f"{name}.svg").write_text(cielab.swatch_svg(triplet))
-        shared = " **shared**" if entry["sharedWithinObject"] == "True" else ""
+        shared = " **shared**" if truthy(entry["sharedWithinObject"]) else ""
         lines.append(
             f'| <img src="{swatch_dir}/{name}.svg" width="16" height="16" '
             f'alt="{entry["hex"]}"> | `{entry["hex"]}`{shared} | '
@@ -617,7 +731,7 @@ def algorithm_identification(rows):
             issues.append("NAME_MISSING")
         elif _uninformative(name):
             issues.append("NAME_UNINFORMATIVE")
-        if row.get("hasAlgorithmIdentification", "") != "True":
+        if not truthy(row.get("hasAlgorithmIdentification")):
             issues.append("NO_IDENTIFICATION")
         elif not (row.get("AlgorithmVersion", "") or "").strip():
             issues.append("NO_VERSION")
@@ -637,7 +751,7 @@ def algorithm_identification(rows):
             # names the software that wrote the file, which on a converted
             # segmentation is the converter.
             "ManufacturerModelName": row.get("ManufacturerModelName", ""),
-            "SoftwareVersion": row.get("SoftwareVersion", ""),
+            "SoftwareVersions": row.get("SoftwareVersions", ""),
             "SeriesDescription": row.get("SeriesDescription", ""),
         })
         findings.append(entry)
@@ -684,9 +798,9 @@ def encoding_tags(path):
     tags = defaultdict(Counter)
     for row in load(path):
         series = row["SeriesInstanceUID"]
-        if row.get("isLossy", "") == "True":
+        if truthy(row.get("isLossy")):
             tags[series]["LOSSY_COMPRESSED"] += 1
-        elif row.get("isCompressed", "") == "False":
+        elif falsy(row.get("isCompressed")):
             tags[series]["UNCOMPRESSED"] += 1
         if int(row.get("emptyFrames") or 0):
             tags[series]["EMPTY_FRAMES_RETAINED"] += 1
@@ -811,75 +925,257 @@ def tracking_uid(rows):
 # ---------------------------------------------------------------------------
 
 
-def entire_flavour(rows, codes_csv):
+def entire_flavour(rows, codes_csv, sequences=None):
+    """Issue 8. `entire` maps CodeValue -> FSN for every code lookup_codes.py
+    flagged; a segment is reported once per sequence that carries such a code."""
+    sequences = sequences or JUDGED_CODE_SEQUENCES
     entire = {}
     for code in load(codes_csv):
         if str(code.get("isEntireFlavour", "")).lower() == "true":
             entire[code["CodeValue"]] = code.get("fsn", "")
     findings = []
     for row in rows:
-        code = row["AnatomicRegionCodeValue"]
-        if code in entire:
-            finding = key(row)
-            finding.update(
-                {
-                    "AnatomicRegionCodeValue": code,
-                    "entireFsn": entire[code],
-                    "meaningRecorded": row["AnatomicRegionCodeMeaning"],
-                }
-            )
-            findings.append(finding)
-    findings.sort(key=lambda f: (f["AnatomicRegionCodeValue"], f["PatientID"]))
+        for sequence in sequences:
+            scheme, code, meaning = _code_in(row, sequence)
+            if code in entire:
+                finding = key(row)
+                finding.update(
+                    {
+                        "codeSequence": sequence,
+                        "CodingSchemeDesignator": scheme,
+                        "CodeValue": code,
+                        "entireFsn": entire[code],
+                        "meaningRecorded": meaning,
+                    }
+                )
+                findings.append(finding)
+    findings.sort(key=lambda f: (f["CodeValue"], f["codeSequence"], f["PatientID"]))
     return findings, entire
 
 
-def curated(rows, review_csv):
-    """Join the curated verdicts on (CodeValue, CodingScheme, CodeMeaning).
+def load_review(path):
+    """Read the curated verdict table (--review) and check its header.
+
+    Returns {(CodeValue, CodingSchemeDesignator, meaningRecorded, codeSequence):
+    entry}. codeSequence is "" where the row does not name one. Raises
+    ValueError, naming the expected header, if the file cannot be joined -
+    a review with the wrong header silently matches nothing otherwise.
+    """
+    with open(path, newline="") as handle:
+        reader = csv.DictReader(handle)
+        header = [h.strip() for h in (reader.fieldnames or [])]
+        entries = list(reader)
+    missing = [column for column in REVIEW_REQUIRED if column not in header]
+    if missing:
+        raise ValueError(
+            f"{path}: the review table lacks {', '.join(missing)}.\n"
+            f"  Expected header (references/terminology.md, templates/review.csv):\n"
+            f"  {','.join(REVIEW_COLUMNS)}"
+        )
+    review = {}
+    for entry in entries:
+        entry = {k.strip(): (v or "").strip() for k, v in entry.items() if k}
+        if not entry.get("CodeValue"):
+            continue
+        if entry["verdict"] not in VERDICTS:
+            raise ValueError(
+                f"{path}: verdict {entry['verdict']!r} on {entry['CodeValue']} is not "
+                f"one of {', '.join(sorted(VERDICTS))}"
+            )
+        review[(
+            entry["CodeValue"],
+            entry.get("CodingSchemeDesignator", ""),
+            entry["meaningRecorded"],
+            entry.get("codeSequence", ""),
+        )] = entry
+    return review
+
+
+def verdict_for(review, row, sequence):
+    """The curated entry for this row's code in this sequence, or None.
+
+    Tries the sequence-specific row first, then a row with no codeSequence.
+    Also accepts a plain {(CodeValue, scheme, meaning): verdict} mapping, for
+    callers that already have verdicts in hand.
+    """
+    scheme, code, meaning = _code_in(row, sequence)
+    if not code:
+        return None
+    for k in (
+        (code, scheme, meaning, sequence),
+        (code, scheme, meaning, ""),
+        (code, scheme, meaning),
+    ):
+        if k in review:
+            entry = review[k]
+            return entry if isinstance(entry, dict) else {"verdict": entry}
+    return None
+
+
+def curated(rows, review, sequences=None):
+    """Issues 1 and 3, from the curated verdicts.
 
     The review is keyed on the PAIRING, not on the code: the same code can be
     correct under one meaning and wrong under another, which is exactly what
-    issue 2 surfaces.
+    issue 2 surfaces. `review` is the dict load_review builds, or a path.
     """
-    review = {}
-    for entry in load(review_csv):
-        review[
-            (
-                entry["CodeValue"],
-                entry.get("CodingSchemeDesignator", ""),
-                entry["meaningRecorded"],
-            )
-        ] = entry
+    sequences = sequences or JUDGED_CODE_SEQUENCES
+    if not isinstance(review, dict):
+        review = load_review(review)
 
     issue1, issue3 = [], []
     for row in rows:
-        entry = review.get(
-            (
-                row["AnatomicRegionCodeValue"],
-                row["AnatomicRegionCodingSchemeDesignator"],
-                row["AnatomicRegionCodeMeaning"],
+        for sequence in sequences:
+            entry = verdict_for(review, row, sequence)
+            if not entry:
+                continue
+            scheme, code, meaning = _code_in(row, sequence)
+            finding = key(row)
+            finding.update(
+                {
+                    "codeSequence": sequence,
+                    "CodingSchemeDesignator": scheme,
+                    "CodeValue": code,
+                    "codeActuallyMeans": entry.get("codeActuallyMeans", ""),
+                    "meaningRecorded": meaning,
+                    "verdict": entry["verdict"],
+                    "reviewSource": entry.get("reviewSource", ""),
+                }
             )
-        )
-        if not entry:
-            continue
-        finding = key(row)
-        finding.update(
-            {
-                "AnatomicRegionCodeValue": row["AnatomicRegionCodeValue"],
-                "codeActuallyMeans": entry.get("codeActuallyMeans", ""),
-                "meaningRecorded": row["AnatomicRegionCodeMeaning"],
-                "verdict": entry["verdict"],
-                "reviewSource": entry.get("reviewSource", ""),
-            }
-        )
-        if entry["verdict"] in ("INVERTED", "UNCODED"):
-            issue3.append(finding)
-        else:
-            issue1.append(finding)
+            if entry["verdict"] in LATERALITY_VERDICTS:
+                issue3.append(finding)
+            else:
+                issue1.append(finding)
 
     rank1 = {"WRONG_ANATOMY": 0, "NARROWER_OR_BROADER": 1, "SPELLING": 2}
-    issue1.sort(key=lambda f: (rank1.get(f["verdict"], 3), f["AnatomicRegionCodeValue"]))
-    issue3.sort(key=lambda f: (f["verdict"] != "INVERTED", f["AnatomicRegionCodeValue"]))
+    issue1.sort(key=lambda f: (rank1.get(f["verdict"], 3), f["CodeValue"]))
+    issue3.sort(key=lambda f: (f["verdict"] != "INVERTED", f["CodeValue"]))
     return issue1, issue3
+
+
+# ---------------------------------------------------------------------------
+# Issue 15 - category and type against their context groups. Read, not
+# computed here: membership needs dcmterms' Parquet, which dcmterm.py reads.
+# Issue 16 - Segment Number. Issue 17 - Frame of Reference. Both computed.
+# ---------------------------------------------------------------------------
+
+
+def property_issues(path):
+    """issue15_property_context_group.csv -> {(category scheme, code, type
+    scheme, code): [issue, ...]}. Written by `dcmterm.py property`."""
+    table = {}
+    for row in load(path):
+        issues = [i for i in (row.get("propertyIssue") or "").split("; ") if i]
+        if issues:
+            table[(row["categoryScheme"], row["categoryCode"],
+                   row["typeScheme"], row["typeCode"])] = issues
+    return table
+
+
+def _property_key(row):
+    return (
+        row.get("SegmentedPropertyCategoryCodingSchemeDesignator", "") or "",
+        row.get("SegmentedPropertyCategoryCodeValue", "") or "",
+        row.get("SegmentedPropertyTypeCodingSchemeDesignator", "") or "",
+        row.get("SegmentedPropertyTypeCodeValue", "") or "",
+    )
+
+
+def segment_numbers(rows):
+    """Issue 16. PS3.3 C.8.20.2.4: Segment Number "shall be unique within each
+    Instance", and where Segmentation Type is BINARY or FRACTIONAL it "shall
+    start at a Value of 1, and increase monotonically by 1".
+
+    One row per object with a problem. Pass the UNFILTERED rows: a LABELMAP's
+    Segment Number 0 is legitimate and is excluded from nothing here, while a 0
+    on a BINARY object is exactly the defect. The order of items in the Segment
+    Sequence is not recoverable from a CSV, so "increase by 1" is checked as
+    "the numbers are exactly 1..n" - an object numbered 2, 1 passes here and is
+    dciodvfy's to report.
+    """
+    objects = defaultdict(list)
+    for row in rows:
+        objects[row["SOPInstanceUID"]].append(row)
+    findings = []
+    for sop, group in objects.items():
+        numbers = []
+        for row in group:
+            try:
+                numbers.append(int(row["SegmentNumber"]))
+            except (TypeError, ValueError):
+                pass  # absent - issue 4's finding, not this one
+        counts = Counter(numbers)
+        duplicates = sorted(n for n, c in counts.items() if c > 1)
+        problems = []
+        if duplicates:
+            problems.append("DUPLICATE")
+        segmentation_type = (group[0].get("SegmentationType") or "").strip().upper()
+        if (
+            segmentation_type in ("BINARY", "FRACTIONAL")
+            and numbers
+            and sorted(numbers) != list(range(1, len(numbers) + 1))
+        ):
+            problems.append("NOT_SEQUENTIAL")
+        if not problems:
+            continue
+        first = group[0]
+        findings.append({
+            "PatientID": first["PatientID"],
+            "StudyInstanceUID": first["StudyInstanceUID"],
+            "SeriesInstanceUID": first["SeriesInstanceUID"],
+            "SOPInstanceUID": sop,
+            "SegmentationType": segmentation_type,
+            "segmentNumberProblem": "; ".join(problems),
+            "segmentNumbers": "/".join(str(n) for n in sorted(numbers)),
+            "duplicateNumbers": "/".join(str(n) for n in duplicates),
+            "segmentsInObject": len(group),
+            "SeriesDescription": first["SeriesDescription"],
+            "viewer_url": first["viewer_url"],
+        })
+    findings.sort(key=lambda f: (f["segmentNumberProblem"], f["PatientID"], f["SOPInstanceUID"]))
+    return findings
+
+
+def frame_of_reference(rows):
+    """Issue 17. PS3.3 A.51.1: "If the referenced images have a defined Frame
+    of Reference, the Segmentation Instance shall have the same Frame of
+    Reference."
+
+    One row per object. Decided only where the referenced series was
+    resolved: an empty referencedFrameOfReferenceUID means "not looked up",
+    never "matches". referencedSeriesFound is "False" only where a lookup was
+    attempted and found nothing, which is the dangling reference.
+    """
+    objects = {}
+    for row in rows:
+        objects.setdefault(row["SOPInstanceUID"], row)
+    findings = []
+    for sop, row in objects.items():
+        referenced = row.get("referencedSeriesInstanceUID", "") or ""
+        found = (row.get("referencedSeriesFound", "") or "").strip()
+        own = (row.get("FrameOfReferenceUID", "") or "").strip()
+        theirs = (row.get("referencedFrameOfReferenceUID", "") or "").strip()
+        if referenced and falsy(found):
+            problem = "REFERENCED_SERIES_MISSING"
+        elif own and theirs and own != theirs:
+            problem = "FRAME_OF_REFERENCE_MISMATCH"
+        else:
+            continue
+        findings.append({
+            "PatientID": row["PatientID"],
+            "StudyInstanceUID": row["StudyInstanceUID"],
+            "SeriesInstanceUID": row["SeriesInstanceUID"],
+            "SOPInstanceUID": sop,
+            "frameOfReferenceProblem": problem,
+            "FrameOfReferenceUID": own,
+            "referencedSeriesInstanceUID": referenced,
+            "referencedFrameOfReferenceUID": theirs,
+            "referencedModality": row.get("referencedModality", ""),
+            "SeriesDescription": row["SeriesDescription"],
+            "viewer_url": row["viewer_url"],
+        })
+    findings.sort(key=lambda f: (f["frameOfReferenceProblem"], f["PatientID"], f["SOPInstanceUID"]))
+    return findings
 
 
 # ---------------------------------------------------------------------------
@@ -888,7 +1184,17 @@ def curated(rows, review_csv):
 
 
 def triage(rows, ambiguous, cosmetic, entire, verdicts, tracking,
-           iod=None, colors=None, algorithms=None, encoding=None):
+           iod=None, colors=None, algorithms=None, encoding=None,
+           sequences=None, properties=None, numbering=None, frames=None):
+    """One row per series, tagged, worst first.
+
+    `ambiguous` / `cosmetic` are keyed (codeSequence, CodeValue) as
+    ambiguous_codes returns them; `verdicts` is the dict load_review builds or
+    a plain {(CodeValue, scheme, meaning): verdict}; `properties` is what
+    property_issues reads from dcmterm.py; `numbering` and `frames` are the
+    findings of segment_numbers and frame_of_reference.
+    """
+    sequences = sequences or JUDGED_CODE_SEQUENCES
     ambiguous_tracking = {
         f["TrackingUID"] for f in tracking if f["sharingPattern"] == "WITHIN_STUDY"
     }
@@ -896,20 +1202,18 @@ def triage(rows, ambiguous, cosmetic, entire, verdicts, tracking,
         f["TrackingUID"] for f in tracking if f["sharingPattern"] == "CROSS_PATIENT"
     }
     dominant = {
-        code: sorted(counter.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
-        for code, counter in ambiguous.items()
+        k: sorted(counter.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
+        for k, counter in ambiguous.items()
     }
-    per_series = defaultdict(lambda: defaultdict(set))
-    for row in rows:
-        if row["AnatomicRegionCodeValue"]:
-            per_series[row["SeriesInstanceUID"]][row["AnatomicRegionCodeValue"]].add(
-                row["AnatomicRegionCodeMeaning"]
-            )
-    self_inconsistent = {
-        series
-        for series, codes in per_series.items()
-        if any(len(m) > 1 for m in codes.values())
-    }
+    self_inconsistent = _self_inconsistent_series(rows, sequences)
+
+    # Issues 16 and 17 are per OBJECT; map them onto the series they belong to.
+    object_tags = defaultdict(Counter)
+    for finding in numbering or []:
+        for problem in finding["segmentNumberProblem"].split("; "):
+            object_tags[finding["SeriesInstanceUID"]][f"SEGMENT_NUMBER_{problem}"] += 1
+    for finding in frames or []:
+        object_tags[finding["SeriesInstanceUID"]][finding["frameOfReferenceProblem"]] += 1
 
     # Issues 13 and 14 are decided per segment by their own checks, so the
     # roll-up reads their verdicts rather than recomputing them - there is one
@@ -945,36 +1249,44 @@ def triage(rows, ambiguous, cosmetic, entire, verdicts, tracking,
         counts = Counter()
         offending = set()
         for row in group:
-            code = row["AnatomicRegionCodeValue"]
-            verdict = verdicts.get(
-                (
-                    code,
-                    row["AnatomicRegionCodingSchemeDesignator"],
-                    row["AnatomicRegionCodeMeaning"],
-                ),
-                "",
-            )
-            if verdict == "INVERTED":
-                counts["LATERALITY_INVERTED"] += 1
-            elif verdict == "UNCODED":
-                counts["LATERALITY_UNCODED"] += 1
-            elif verdict in ("WRONG_ANATOMY", "NARROWER_OR_BROADER"):
-                counts["ANATOMY_CONFLICT"] += 1
-            elif verdict == "SPELLING":
-                counts["CODE_MEANING_SPELLING"] += 1
-            if verdict in ("INVERTED", "WRONG_ANATOMY", "NARROWER_OR_BROADER"):
-                offending.add(f'{code} "{row["AnatomicRegionCodeMeaning"]}"')
+            # The code-level tags are counted once per SEGMENT, however many of
+            # its sequences carry the offending code: the segment is the unit
+            # of work, and a liver coded as bowel in both the region and the
+            # type is one segment to recode, not two.
+            segment_tags = set()
+            for sequence in sequences:
+                _, code, meaning = _code_in(row, sequence)
+                if not code:
+                    continue
+                entry = verdict_for(verdicts, row, sequence)
+                verdict = entry["verdict"] if entry else ""
+                if verdict == "INVERTED":
+                    segment_tags.add("LATERALITY_INVERTED")
+                elif verdict == "UNCODED":
+                    segment_tags.add("LATERALITY_UNCODED")
+                elif verdict in ("WRONG_ANATOMY", "NARROWER_OR_BROADER"):
+                    segment_tags.add("ANATOMY_CONFLICT")
+                elif verdict == "SPELLING":
+                    segment_tags.add("CODE_MEANING_SPELLING")
+                if verdict in ("INVERTED", "WRONG_ANATOMY", "NARROWER_OR_BROADER"):
+                    offending.add(f'{code} "{meaning}"')
 
-            if code in ambiguous:
-                counts["CODE_AMBIGUOUS_ELSEWHERE"] += 1
-                if series in self_inconsistent:
-                    counts["CODE_SELF_INCONSISTENT"] += 1
-                elif row["AnatomicRegionCodeMeaning"] != dominant[code]:
-                    counts["CODE_MEANING_MINORITY"] += 1
-                if code in cosmetic:
-                    counts["COSMETIC_VARIANT"] += 1
-            if code in entire:
-                counts["ENTIRE_CODE_FLAVOUR"] += 1
+                k = (sequence, code)
+                if k in ambiguous:
+                    segment_tags.add("CODE_AMBIGUOUS_ELSEWHERE")
+                    if series in self_inconsistent:
+                        segment_tags.add("CODE_SELF_INCONSISTENT")
+                    elif meaning != dominant[k]:
+                        segment_tags.add("CODE_MEANING_MINORITY")
+                    if k in cosmetic:
+                        segment_tags.add("COSMETIC_VARIANT")
+                if code in entire:
+                    segment_tags.add("ENTIRE_CODE_FLAVOUR")
+            for tag in segment_tags:
+                counts[tag] += 1
+
+            for issue in (properties or {}).get(_property_key(row), []):
+                counts[issue] += 1
             if any(not row[column] for column, _ in TYPE1):
                 counts["MALFORMED_SEGMENT"] += 1
             if any(row.get(f"{prefix}CodingSchemeDesignator", "") in RETIRED_SCHEMES
@@ -995,11 +1307,13 @@ def triage(rows, ambiguous, cosmetic, entire, verdicts, tracking,
             ).items():
                 counts[tag] += count
 
-        # Issues 9, 11 and 12 are per OBJECT, not per segment, so they join at
-        # the series.
+        # Issues 9, 11, 12, 16 and 17 are per OBJECT, not per segment, so they
+        # join at the series.
         for tag, count in (iod or {}).get(series, {}).items():
             counts[tag] += count
         for tag, count in (encoding or {}).get(series, {}).items():
+            counts[tag] += count
+        for tag, count in object_tags.get(series, {}).items():
             counts[tag] += count
 
         tags = [t for t in TAG_ORDER if counts[t]]
@@ -1064,6 +1378,20 @@ def main():
         "only - both need the objects, not a metadata table.",
     )
     parser.add_argument(
+        "--property",
+        help="issue15_property_context_group.csv from `dcmterm.py property`; "
+        "folds issue 15 (category and type against CID 7150 / 7151, and the "
+        "type against the category's own type context group) into the triage "
+        "list. Runs on every access path.",
+    )
+    parser.add_argument(
+        "--sequences",
+        default=",".join(JUDGED_CODE_SEQUENCES),
+        help="comma-separated code sequences the terminology checks (issues 1, "
+        "2, 3, 8) judge (default: %(default)s). Narrow it only to reproduce an "
+        "older, region-only review.",
+    )
+    parser.add_argument(
         "--color-delta-e",
         type=float,
         default=10.0,
@@ -1083,14 +1411,20 @@ def main():
     )
     args = parser.parse_args()
 
-    rows = load(args.table)
-    if not rows:
+    all_rows = load(args.table)
+    if not all_rows:
         sys.exit(f"{args.table} is empty")
+    sequences = [s.strip() for s in args.sequences.split(",") if s.strip()]
+    unknown = [s for s in sequences if s not in JUDGED_CODE_SEQUENCES]
+    if unknown:
+        sys.exit(f"--sequences: unknown {', '.join(unknown)}; choose from "
+                 f"{', '.join(JUDGED_CODE_SEQUENCES)}")
 
-    total = len(rows)
+    total = len(all_rows)
+    rows = all_rows
     if not args.include_background:
-        rows = [r for r in rows if r["isBackgroundSegment"] != "True"]
-    multi = sum(1 for r in rows if r["multiValuedCodeSequence"] == "True")
+        rows = [r for r in all_rows if not truthy(r["isBackgroundSegment"])]
+    multi = sum(1 for r in rows if truthy(r["multiValuedCodeSequence"]))
 
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
@@ -1102,18 +1436,41 @@ def main():
             "count below\n     understates - handle those by hand.\n"
         )
 
+    # ---- which sequence carries the anatomy. Step 1 of the workflow, and the
+    # first thing the report says about the batch.
+    summary = code_sequence_summary(rows)
+    write(outdir, "code_sequences.csv", summary,
+          ["codeSequence", "segmentsWithCode", "segments", "distinctCodes",
+           "distinctMeanings", "schemes"])
+    print("\nCode sequences populated (the terminology checks judge all three):")
+    for entry in summary:
+        share = entry["segmentsWithCode"] / len(rows) if rows else 0
+        print(f"  {entry['codeSequence']:<26} {entry['segmentsWithCode']:>6} of "
+              f"{len(rows)} segments ({share:.0%}), {entry['distinctCodes']} codes  "
+              f"{entry['schemes']}")
+    region = next(e for e in summary if e["codeSequence"] == "AnatomicRegion")
+    if rows and region["segmentsWithCode"] < len(rows) / 2:
+        print("  -> AnatomicRegionSequence (Type 3) is absent on most segments: the "
+              "anatomy lives in\n     SegmentedPropertyTypeCodeSequence here. Say "
+              "so in the report.")
+    print()
+
     # ---- computed
-    amb, ambiguous, cosmetic = ambiguous_codes(rows)
+    amb, ambiguous, cosmetic = ambiguous_codes(rows, sequences)
     write(outdir, "issue2_ambiguous_code.csv", amb,
           ["PatientID", "StudyInstanceUID", "SeriesInstanceUID", "SegmentNumber",
-           "SegmentLabel", "AnatomicRegionCodeValue", "AnatomicRegionCodeMeaning",
-           "dominantMeaning", "distinctMeanings", "scope", "cosmeticCandidate",
-           "viewer_url"])
+           "SegmentLabel", "codeSequence", "CodingSchemeDesignator", "CodeValue",
+           "CodeMeaning", "dominantMeaning", "distinctMeanings", "scope",
+           "cosmeticCandidate", "viewer_url"])
     scopes = Counter(f["scope"] for f in amb)
     print(f"Issue 2  ambiguous codes  {len(ambiguous):>5} codes, {len(amb):>6} segments")
     for scope in ("SELF_INCONSISTENT", "MINORITY_MEANING", "DOMINANT_MEANING"):
         note = "  <- not evidence about the segment" if scope.startswith("DOM") else ""
         print(f"           {scope:<20} {scopes[scope]:>6}{note}")
+    by_sequence = Counter(k[0] for k in ambiguous)
+    if len(by_sequence) > 1 or (by_sequence and "AnatomicRegion" not in by_sequence):
+        print("           by sequence: " + ", ".join(
+            f"{s}={n}" for s, n in by_sequence.most_common()))
 
     mal = malformed(rows)
     write(outdir, "issue4_malformed_segment.csv", mal,
@@ -1168,6 +1525,41 @@ def main():
     else:
         print("Issue 10 retired scheme        0 segments  ok: no SRT/SNM3 codes")
 
+    numbering = segment_numbers(all_rows)
+    write(outdir, "issue16_segment_numbers.csv", numbering,
+          ["PatientID", "StudyInstanceUID", "SeriesInstanceUID", "SOPInstanceUID",
+           "SegmentationType", "segmentNumberProblem", "segmentNumbers",
+           "duplicateNumbers", "segmentsInObject", "SeriesDescription",
+           "viewer_url"])
+    number_problems = Counter(
+        p for f in numbering for p in f["segmentNumberProblem"].split("; "))
+    if numbering:
+        print(f"Issue 16 segment numbers  {len(numbering):>6} objects  "
+              + ", ".join(f"{k}={v}" for k, v in number_problems.most_common()))
+    else:
+        print("Issue 16 segment numbers       0 objects  ok: unique, and 1..n on "
+              "BINARY/FRACTIONAL")
+
+    frames = frame_of_reference(rows)
+    write(outdir, "issue17_frame_of_reference.csv", frames,
+          ["PatientID", "StudyInstanceUID", "SeriesInstanceUID", "SOPInstanceUID",
+           "frameOfReferenceProblem", "FrameOfReferenceUID",
+           "referencedSeriesInstanceUID", "referencedFrameOfReferenceUID",
+           "referencedModality", "SeriesDescription", "viewer_url"])
+    resolved = sum(1 for r in rows if r.get("referencedFrameOfReferenceUID")
+                   or r.get("referencedSeriesFound"))
+    if frames:
+        frame_problems = Counter(f["frameOfReferenceProblem"] for f in frames)
+        print(f"Issue 17 frame of reference {len(frames):>4} objects  "
+              + ", ".join(f"{k}={v}" for k, v in frame_problems.most_common()))
+    elif resolved:
+        print("Issue 17 frame of reference    0 objects  ok: every resolved "
+              "reference shares the SEG's Frame of Reference")
+    else:
+        print("Issue 17 frame of reference    - not checked: the referenced series "
+              "were not resolved\n           (seg_attributes.py --resolve-referenced, "
+              "or @@IMAGE_TABLE@@ in sql/01)")
+
     colors, palette = recommended_color(rows, args.color_delta_e)
     write(outdir, "issue13_recommended_color.csv", colors,
           ["PatientID", "StudyInstanceUID", "SeriesInstanceUID", "SOPInstanceUID",
@@ -1205,7 +1597,7 @@ def main():
            "SegmentNumber", "SegmentLabel", "SegmentAlgorithmType",
            "algorithmIssues", "SegmentAlgorithmName", "AlgorithmName",
            "AlgorithmVersion", "AlgorithmSource", "AlgorithmNameCodeMeaning",
-           "ManufacturerModelName", "SoftwareVersion", "SeriesDescription",
+           "ManufacturerModelName", "SoftwareVersions", "SeriesDescription",
            "viewer_url"])
     automatic = [
         r for r in rows
@@ -1249,8 +1641,8 @@ def main():
         encoding = encoding_tags(args.encoding)
         objects = load(args.encoding)
         empty = [o for o in objects if int(o.get("emptyFrames") or 0)]
-        lossy = [o for o in objects if o.get("isLossy") == "True"]
-        uncompressed = [o for o in objects if o.get("isCompressed") == "False"]
+        lossy = [o for o in objects if truthy(o.get("isLossy"))]
+        uncompressed = [o for o in objects if falsy(o.get("isCompressed"))]
         print(f"Issue 11 empty frames     {len(empty):>6} of {len(objects)} objects "
               "keep at least one all-zero frame")
         print(f"Issue 12 compression      {len(uncompressed):>6} of {len(objects)} "
@@ -1259,14 +1651,26 @@ def main():
         print("Issues 11, 12 skipped - run seg_encoding.py and pass --encoding "
               "(local files only)")
 
+    # ---- read from dcmterm.py property, if it was run
+    properties = None
+    if args.property:
+        properties = property_issues(args.property)
+        affected = sum(1 for r in rows if _property_key(r) in properties)
+        kinds = Counter(i for issues in properties.values() for i in issues)
+        print(f"Issue 15 property CIDs    {affected:>6} segments  "
+              + (", ".join(f"{k}={v} pairs" for k, v in kinds.most_common())
+                 or "ok: every category is in CID 7150 and every type in its CID"))
+    else:
+        print("Issue 15 skipped - run `dcmterm.py property` and pass --property")
+
     # ---- needs the FSN lookup
     entire = {}
     if args.codes:
-        ent, entire = entire_flavour(rows, args.codes)
+        ent, entire = entire_flavour(rows, args.codes, sequences)
         write(outdir, "issue8_entire_code_flavour.csv", ent,
               ["PatientID", "StudyInstanceUID", "SeriesInstanceUID", "SegmentNumber",
-               "SegmentLabel", "AnatomicRegionCodeValue", "entireFsn",
-               "meaningRecorded", "viewer_url"])
+               "SegmentLabel", "codeSequence", "CodingSchemeDesignator", "CodeValue",
+               "entireFsn", "meaningRecorded", "viewer_url"])
         print(f'Issue 8  "Entire X" codes {len(entire):>5} codes, {len(ent):>6} segments')
     else:
         print("Issue 8  skipped - run lookup_codes.py and pass --codes")
@@ -1274,31 +1678,38 @@ def main():
     # ---- curated
     verdicts = {}
     if args.review:
-        one, three = curated(rows, args.review)
+        try:
+            verdicts = load_review(args.review)
+        except ValueError as exc:
+            sys.exit(str(exc))
+        one, three = curated(rows, verdicts, sequences)
         columns = ["PatientID", "StudyInstanceUID", "SeriesInstanceUID",
-                   "SegmentNumber", "SegmentLabel", "AnatomicRegionCodeValue",
-                   "codeActuallyMeans", "meaningRecorded", "verdict",
-                   "reviewSource", "viewer_url"]
+                   "SegmentNumber", "SegmentLabel", "codeSequence",
+                   "CodingSchemeDesignator", "CodeValue", "codeActuallyMeans",
+                   "meaningRecorded", "verdict", "reviewSource", "viewer_url"]
         write(outdir, "issue1_anatomy_conflict.csv", one, columns)
         write(outdir, "issue3_laterality.csv", three, columns)
-        for entry in load(args.review):
-            verdicts[
-                (entry["CodeValue"], entry.get("CodingSchemeDesignator", ""),
-                 entry["meaningRecorded"])
-            ] = entry["verdict"]
         v1 = Counter(f["verdict"] for f in one)
         v3 = Counter(f["verdict"] for f in three)
         print(f"Issue 1  anatomy conflict {len(one):>6} segments  "
               + ", ".join(f"{k}={v}" for k, v in v1.most_common()))
         print(f"Issue 3  laterality       {len(three):>6} segments  "
               + ", ".join(f"{k}={v}" for k, v in v3.most_common()))
+        unused = len(verdicts) - len({
+            (f["CodeValue"], f["CodingSchemeDesignator"], f["meaningRecorded"])
+            for f in one + three})
+        if unused:
+            print(f"           {unused} review rows matched no segment - a stale "
+                  "verdict, or a header value that\n           does not match the "
+                  "table exactly (CodeMeaning is compared verbatim)")
     else:
         print("Issues 1, 3  skipped - curated, need --review "
               "(see references/terminology.md)")
 
     # ---- roll-up
     series = triage(rows, ambiguous, cosmetic, entire, verdicts, track, iod,
-                    colors, algorithms, encoding)
+                    colors, algorithms, encoding, sequences=sequences,
+                    properties=properties, numbering=numbering, frames=frames)
     path = write(outdir, "series_triage.csv", series,
                  ["PatientID", "StudyInstanceUID", "SeriesInstanceUID", "issues",
                   "worstSeverity", "segmentCount", "segmentsNeedingRecode",

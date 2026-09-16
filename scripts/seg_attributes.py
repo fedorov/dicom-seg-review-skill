@@ -87,12 +87,16 @@ COLUMNS = [
     "TransferSyntaxUID",
     "Manufacturer",
     "ManufacturerModelName",
-    "SoftwareVersion",
+    "SoftwareVersions",
     "segmentsInInstance",
     "numberOfFrames",
     "referencedSeriesInstanceUID",
     "referencedModality",
     "referencedBodyPartExamined",
+    "referencedFrameOfReferenceUID",
+    "referencedSeriesFound",
+    "referencedInstanceCount",
+    "referencedSeriesCount",
     "isBackgroundSegment",
     "multiValuedCodeSequence",
     "viewer_url",
@@ -246,6 +250,11 @@ def extract_instance(ds, viewer_url_pattern=None, collection="", referenced=None
     segment column empty, so that the conformance check reports it rather than
     the object vanishing from the review.
     """
+    # `referenced` is None when the referenced series were not looked up and a
+    # dict - possibly empty - when they were. The difference is what lets
+    # referencedSeriesFound say "False" only for a lookup that found nothing,
+    # which is issue 17's dangling reference, and stay empty otherwise.
+    resolved = referenced is not None
     referenced = referenced or {}
     ref_series = _first(getattr(ds, "ReferencedSeriesSequence", None))
     ref_series_uid = str(getattr(ref_series, "SeriesInstanceUID", "") or "")
@@ -273,7 +282,7 @@ def extract_instance(ds, viewer_url_pattern=None, collection="", referenced=None
         ),
         "Manufacturer": _scalar(ds, "Manufacturer"),
         "ManufacturerModelName": _scalar(ds, "ManufacturerModelName"),
-        "SoftwareVersion": _scalar(ds, "SoftwareVersions"),
+        "SoftwareVersions": _scalar(ds, "SoftwareVersions"),
         "numberOfFrames": _scalar(ds, "NumberOfFrames"),
         "referencedSeriesInstanceUID": ref_series_uid,
         # Only some producers copy these into ReferencedSeriesSequence, so fall
@@ -284,6 +293,23 @@ def extract_instance(ds, viewer_url_pattern=None, collection="", referenced=None
             getattr(ref_series, "BodyPartExamined", "") or ""
         )
         or ref_info.get("BodyPartExamined", ""),
+        # Issue 17. PS3.3 A.51.1: a segmentation "shall have the same Frame of
+        # Reference" as referenced images that define one. Empty means the
+        # referenced series was not looked up - never "matches".
+        "referencedFrameOfReferenceUID": ref_info.get("FrameOfReferenceUID", ""),
+        "referencedSeriesFound": (
+            str(ref_series_uid in referenced) if resolved and ref_series_uid else ""
+        ),
+        # Same two counts the BigQuery view carries: how many source instances
+        # the first referenced series lists (compare with numberOfFrames), and
+        # how many series are referenced (above 1, the columns above describe
+        # only the first).
+        "referencedInstanceCount": (
+            str(len(getattr(ref_series, "ReferencedInstanceSequence", None) or []))
+            if ref_series is not None else ""
+        ),
+        "referencedSeriesCount": str(
+            len(getattr(ds, "ReferencedSeriesSequence", None) or [])),
     }
 
     if viewer_url_pattern:
@@ -402,10 +428,12 @@ def read_files(directory, resolve_referenced=False):
         if ref is not None and getattr(ref, "SeriesInstanceUID", None):
             referenced_uids.add(str(ref.SeriesInstanceUID))
 
-    referenced = {}
+    referenced = {} if resolve_referenced else None
     if resolve_referenced and referenced_uids:
-        # One instance of each referenced series is enough for Modality and
-        # BodyPartExamined; stop looking once every series is accounted for.
+        # One instance of each referenced series is enough for Modality,
+        # BodyPartExamined and the Frame of Reference; stop looking once every
+        # series is accounted for. A series never found stays out of the dict,
+        # which is how issue 17 learns the reference dangles.
         for path in paths:
             if len(referenced) == len(referenced_uids):
                 break
@@ -415,12 +443,18 @@ def read_files(directory, resolve_referenced=False):
                 continue
             uid = str(getattr(ds, "SeriesInstanceUID", "") or "")
             if uid in referenced_uids and uid not in referenced:
-                referenced[uid] = {
-                    "Modality": str(getattr(ds, "Modality", "") or ""),
-                    "BodyPartExamined": str(getattr(ds, "BodyPartExamined", "") or ""),
-                }
+                referenced[uid] = _referenced_facts(ds)
 
     return datasets, counts, referenced
+
+
+def _referenced_facts(ds):
+    """What the per-segment table records about a referenced image series."""
+    return {
+        "Modality": str(getattr(ds, "Modality", "") or ""),
+        "BodyPartExamined": str(getattr(ds, "BodyPartExamined", "") or ""),
+        "FrameOfReferenceUID": str(getattr(ds, "FrameOfReferenceUID", "") or ""),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -462,7 +496,51 @@ def _dicomweb_client(endpoint, use_gcp):
     return DICOMwebClient(url=url, session=session)
 
 
-def read_dicomweb(endpoint, use_gcp=False, workers=8, limit=None):
+def _resolve_referenced_dicomweb(client, datasets):
+    """One instance of each referenced series, for Modality, BodyPartExamined
+    and the Frame of Reference - one QIDO and one metadata request per distinct
+    referenced series.
+
+    The QIDO is an instance search filtered on SeriesInstanceUID at the root,
+    which Healthcare API, dcm4chee and Orthanc all accept. A series the store
+    does not hold stays out of the dict - issue 17's dangling reference. A
+    request that FAILS is recorded as found-but-unknown instead, so a flaky
+    connection cannot manufacture a missing series.
+    """
+    pydicom = _require_pydicom()
+    uids = set()
+    for ds in datasets:
+        ref = _first(getattr(ds, "ReferencedSeriesSequence", None))
+        if ref is not None and getattr(ref, "SeriesInstanceUID", None):
+            uids.add(str(ref.SeriesInstanceUID))
+    referenced = {}
+    for uid in sorted(uids):
+        try:
+            hits = client.search_for_instances(
+                search_filters={"SeriesInstanceUID": uid}, limit=1)
+        except Exception as exc:
+            print(f"  ! referenced series {uid}: search failed ({exc})", file=sys.stderr)
+            referenced[uid] = {}
+            continue
+        if not hits:
+            continue
+        study = hits[0].get("0020000D", {}).get("Value", [""])[0]
+        sop = hits[0].get("00080018", {}).get("Value", [""])[0]
+        try:
+            metadata = client.retrieve_instance_metadata(
+                study_instance_uid=study, series_instance_uid=uid,
+                sop_instance_uid=sop)
+        except Exception as exc:
+            print(f"  ! referenced series {uid}: metadata failed ({exc})",
+                  file=sys.stderr)
+            referenced[uid] = {}
+            continue
+        referenced[uid] = _referenced_facts(pydicom.Dataset.from_json(metadata))
+    return referenced
+
+
+def read_dicomweb(endpoint, use_gcp=False, workers=8, limit=None,
+                  resolve_referenced=False):
     """Find SEG instances by QIDO, then fetch each series' metadata by WADO.
 
     QIDO never returns SegmentSequence, whatever includefield says, so the
@@ -526,7 +604,12 @@ def read_dicomweb(endpoint, use_gcp=False, workers=8, limit=None):
                     datasets.append(ds)
                 else:
                     counts["not_seg"] += 1
-    return datasets, counts, {}
+
+    referenced = None
+    if resolve_referenced:
+        referenced = _resolve_referenced_dicomweb(client, datasets)
+        counts["referenced_series_resolved"] = sum(1 for v in referenced.values() if v)
+    return datasets, counts, referenced
 
 
 # ---------------------------------------------------------------------------
@@ -561,7 +644,10 @@ def main():
     parser.add_argument(
         "--resolve-referenced",
         action="store_true",
-        help="fill referenced Modality / BodyPartExamined from the image series",
+        help="read one instance of each referenced image series - from the same "
+        "directory tree, or the same DICOMweb store - for its Modality, "
+        "BodyPartExamined and FrameOfReferenceUID. Without it issue 17 (Frame "
+        "of Reference) cannot be decided.",
     )
     parser.add_argument("--gcp", action="store_true", help="authenticate to Healthcare API")
     parser.add_argument("--workers", type=int, default=8)
@@ -574,7 +660,7 @@ def main():
     else:
         print(f"Querying {args.dicomweb} ...", file=sys.stderr)
         datasets, counts, referenced = read_dicomweb(
-            args.dicomweb, args.gcp, args.workers, args.limit
+            args.dicomweb, args.gcp, args.workers, args.limit, args.resolve_referenced
         )
 
     rows = []
@@ -610,6 +696,15 @@ def main():
             "these from any count of what was segmented",
             file=sys.stderr,
         )
+
+    # Which sequence carries the anatomy. Category and type are Type 1, the
+    # anatomic region Type 3, so this differs by producer - and a report that
+    # does not say which is which sends its reader to an empty column.
+    print("\n  Code sequences populated (all three are judged by seg_checks.py):",
+          file=sys.stderr)
+    for prefix in ("AnatomicRegion", "SegmentedPropertyType", "SegmentedPropertyCategory"):
+        coded = sum(1 for r in rows if r[f"{prefix}CodeValue"])
+        print(f"  {coded:>7} segments carry a {prefix} code", file=sys.stderr)
     if multi:
         print(
             f"\n  !! {multi} segments carry more than one code per sequence. Only the "

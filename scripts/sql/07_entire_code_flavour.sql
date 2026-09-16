@@ -2,9 +2,11 @@
 
 # table-description:
 # Issue 8 - severity Medium. Segments coded with the SNOMED "Entire X" flavour
-# of an anatomic concept rather than the "X structure" flavour DICOM uses.
+# of an anatomic concept rather than the "X structure" flavour DICOM uses - in
+# the anatomic region, the segmented property type or the segmented property
+# category.
 #
-# One row per affected segment.
+# One row per affected (segment, sequence).
 #
 # SNOMED carries two body-structure concepts for most anatomy: 302508007
 # "Entire colon (body structure)" denotes the complete organ only, while
@@ -58,33 +60,63 @@ WITH
              'Colon' AS replacementMeaning),
       ('181279003', 'Entire spleen', '78961009', 'Spleen'),
       ('181757009', 'Entire cervical lymph node', NULL, NULL)])
+  ),
+
+  # One row per (segment, code sequence) - identical to the CTE in 02.
+  codes AS (
+    SELECT seg.*, 'AnatomicRegion' AS codeSequence,
+      AnatomicRegionCodingSchemeDesignator AS CodingSchemeDesignator,
+      AnatomicRegionCodeValue AS CodeValue,
+      AnatomicRegionCodeMeaning AS CodeMeaning
+    FROM `@@SEG_ATTRIBUTES@@` AS seg
+    WHERE AnatomicRegionCodeValue IS NOT NULL AND NOT isBackgroundSegment
+    UNION ALL
+    SELECT seg.*, 'SegmentedPropertyType',
+      SegmentedPropertyTypeCodingSchemeDesignator,
+      SegmentedPropertyTypeCodeValue,
+      SegmentedPropertyTypeCodeMeaning
+    FROM `@@SEG_ATTRIBUTES@@` AS seg
+    WHERE SegmentedPropertyTypeCodeValue IS NOT NULL AND NOT isBackgroundSegment
+    UNION ALL
+    SELECT seg.*, 'SegmentedPropertyCategory',
+      SegmentedPropertyCategoryCodingSchemeDesignator,
+      SegmentedPropertyCategoryCodeValue,
+      SegmentedPropertyCategoryCodeMeaning
+    FROM `@@SEG_ATTRIBUTES@@` AS seg
+    WHERE SegmentedPropertyCategoryCodeValue IS NOT NULL AND NOT isBackgroundSegment
   )
 
 SELECT
   # description:
   # DICOM PatientID
-  seg.PatientID,
+  codes.PatientID,
   # description:
   # DICOM StudyInstanceUID of the study containing the segmentation
-  seg.StudyInstanceUID,
+  codes.StudyInstanceUID,
   # description:
   # DICOM SeriesInstanceUID of the segmentation series
-  seg.SeriesInstanceUID,
+  codes.SeriesInstanceUID,
   # description:
   # DICOM SegmentNumber within its segmentation object
-  seg.SegmentNumber,
+  codes.SegmentNumber,
   # description:
   # DICOM SegmentLabel of the affected segment
-  seg.SegmentLabel,
+  codes.SegmentLabel,
+  # description:
+  # Which code sequence carries the "Entire" flavour code
+  codes.codeSequence,
+  # description:
+  # CodingSchemeDesignator of the code
+  codes.CodingSchemeDesignator,
   # description:
   # The "Entire" flavour CodeValue the segment carries
-  seg.AnatomicRegionCodeValue,
+  codes.CodeValue,
   # description:
   # Its SNOMED fully specified name, which is what marks it as that flavour
   entireFlavourCodes.entireFsn,
   # description:
   # The CodeMeaning the segment records
-  seg.AnatomicRegionCodeMeaning AS meaningRecorded,
+  codes.CodeMeaning AS meaningRecorded,
   # description:
   # The "structure" flavour code DICOM uses instead, where one exists. NULL
   # means the coding needs a decision rather than a substitution.
@@ -94,15 +126,14 @@ SELECT
   entireFlavourCodes.replacementMeaning,
   # description:
   # URL opening the segmentation series in the viewer
-  seg.viewer_url
+  codes.viewer_url
 FROM
-  `@@SEG_ATTRIBUTES@@` AS seg
+  codes
 JOIN
   entireFlavourCodes
-  ON entireFlavourCodes.code = seg.AnatomicRegionCodeValue
-WHERE
-  NOT seg.isBackgroundSegment
+  ON entireFlavourCodes.code = codes.CodeValue
 ORDER BY
   entireFlavourCodes.suggestedReplacement IS NULL DESC,
-  seg.AnatomicRegionCodeValue,
-  seg.PatientID
+  codes.CodeValue,
+  codes.codeSequence,
+  codes.PatientID

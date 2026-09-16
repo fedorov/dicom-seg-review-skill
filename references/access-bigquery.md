@@ -80,6 +80,11 @@ from whatever backup happens to hold it.
 - **Backfilling the referenced series' `Modality` / `BodyPartExamined`** — only some
   producers copy them into `ReferencedSeriesSequence`, so join the image series and
   `COALESCE`.
+- **`referencedFrameOfReferenceUID` and `referencedSeriesFound`** from the same
+  join, which is what decides issue 17. This path always resolves the references;
+  the file and DICOMweb extractors need `--resolve-referenced`.
+- **`Collection`**, NULL by default so the table has the same shape as the other
+  paths; on IDC, select `collection_id` into it.
 - **`viewer_url`** on every row, so examples in the report are clickable.
 - **`# description:` comment blocks** above each output column, per the
   [idc-index-data](https://github.com/ImagingDataCommons/idc-index-data) convention,
@@ -153,13 +158,31 @@ issue 13. Whichever you use, name it in the report — it is a choice, not a fac
 | `13_retired_coding_scheme.sql` | issue 10 | computed |
 | `14_recommended_color.sql` | issue 13 | computed |
 | `15_algorithm_identification.sql` | issue 14 | computed |
+| `16_segment_numbers.sql` | issue 16 | computed |
+| `17_frame_of_reference.sql` | issue 17 | computed |
 
 File numbers are **not** issue numbers — they are the order the files were added, and
 issues are numbered separately so that a report can cite an issue for good. The
 numbering after `12` looks odd for that reason: the roll-up was written before issues
-10, 13 and 14 existed. It does not read the other files' output, so their position
-relative to it does not matter; `12` recomputes each tag from the per-segment view, and
-each numbered file is the place the definition is *documented*.
+10, 13, 14, 16 and 17 existed. It does not read the other files' output, so their
+position relative to it does not matter; `12` recomputes each tag from the per-segment
+view, and each numbered file is the place the definition is *documented*.
+
+**`02`, `03`, `05`, `06`, `07` and `12` judge three code sequences**, not the anatomic
+region alone. Each opens with the same `codes` CTE — one row per (segment, sequence)
+over the region, the property type and the property category — and their outputs
+carry a `codeSequence` column. Keep that CTE identical across the six files. The
+review table has a `codeSequence` column too; NULL applies the verdict wherever the
+pairing appears.
+
+**Issue 15 has no SQL form.** Membership in CID 7151 is a transitive closure over
+dcmterms' Include-CID edges, and the category → type link is a column of CID 7150;
+both live in Parquet tables `dcmterm.py` reads. Export the per-segment view to CSV
+and run `scripts/dcmterm.py property` on it, then fold the result in with
+`seg_checks.py --property`.
+
+**Exporting to CSV changes booleans to `true` / `false`.** The scripts accept
+either case; a hand-written join against `isBackgroundSegment = 'True'` will not.
 
 Deploy `04_code_review_template.sql` as a **view of its own** and have `05`, `06` and
 `12` join it. Editing a verdict then means editing one file, not three. The alternative

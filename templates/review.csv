@@ -1,0 +1,3 @@
+CodeValue,CodingSchemeDesignator,codeSequence,meaningRecorded,codeActuallyMeans,verdict,reviewSource,issue
+10200004,SCT,,Large bowel,liver,WRONG_ANATOMY,dcmterm,1
+110634007,SCT,AnatomicRegion,Left adnexa,right uterine adnexa,INVERTED,tx.fhir.org,3

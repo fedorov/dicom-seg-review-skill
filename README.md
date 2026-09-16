@@ -5,23 +5,24 @@ Segmentation (SEG) objects are **coded and encoded**.
 
 It finds the defects that make a segmentation delivery unusable downstream: a segment
 labelled "Large bowel" whose code denotes the liver, one code carrying five different
-meanings, a left structure coded as the right one, a segment missing attributes DICOM
-makes Type 1, an object that does not conform to the Segmentation IOD or whose
-`PixelData` is the wrong length for the frames it claims, two organs a viewer will
-draw in the same colour, a BINARY object that shipped a thousand all-zero frames
-uncompressed, and an AI-produced segmentation that does not say which model produced
-it.
+meanings, a left structure coded as the right one, a lesion type filed under the
+"Anatomical Structure" category, an object that does not conform to the Segmentation
+IOD, a segmentation whose Frame of Reference is not its source image's, two organs a
+viewer will draw in the same colour, a BINARY object that shipped a thousand all-zero
+frames uncompressed, and an AI-produced segmentation that does not say which model
+produced it.
 
 ## Install
 
 ```bash
 git clone <this repo> ~/github/dicom-seg-review-skill
 ln -s ~/github/dicom-seg-review-skill ~/.claude/skills/dicom-seg-review
+pip install -r ~/github/dicom-seg-review-skill/requirements.txt   # optional, for the scripts
 ```
 
-Claude Code then loads it automatically when a task is about reviewing or QC'ing DICOM
-segmentations. Nothing else is needed for the guidance; the scripts have optional
-dependencies (below).
+Claude Code loads the skill when a task is about reviewing or QC'ing DICOM
+segmentations. The guidance needs nothing installed; the scripts have the optional
+dependencies listed below.
 
 ## What it produces
 
@@ -33,7 +34,7 @@ dependencies (below).
 ## Three access paths, one table
 
 Whether the metadata is in BigQuery, a DICOMweb store, or a directory of files, every
-path produces the **same per-segment table**, and every check runs on that.
+path produces the **same 61-column per-segment table**, and every check runs on that.
 
 ```
 BigQuery metadata table ─┐
@@ -43,19 +44,33 @@ Directory of .dcm files ─┤                                         │
                          └─> seg_encoding  (files only) ───────────┴─> triage CSV
 ```
 
-Three checks are not like the others. Issue 9 runs `dciodvfy` against the objects;
-issue 11 reads the pixel data to find all-zero frames; issue 12 reads the transfer
-syntax out of the file meta group. None of the three exists in a metadata export, so
-a triage list built from BigQuery alone is *silent* about IOD conformance, empty
-frames and compression — not clean.
+Three checks need the objects: issue 9 runs `dciodvfy`, issue 11 reads the pixel
+data, issue 12 reads the transfer syntax. Issue 17 needs the referenced image series
+resolved. Where a path cannot run a check, the triage list is *silent* about it, not
+clean, and the report says so.
+
+## Usage
+
+The method — workflow, severity scale, traps — is [SKILL.md](SKILL.md), and each
+step there carries its commands. The shortest useful run, on local files:
+
+```bash
+python scripts/seg_attributes.py --files /path/to/delivery --resolve-referenced -o seg_attributes.csv
+python scripts/seg_checks.py seg_attributes.csv --outdir findings/
+python scripts/dcmterm.py coverage seg_attributes.csv -o findings/coverage.csv
+```
+
+`python scripts/make_fixture.py /tmp/seg-fixture` writes a small synthetic delivery
+with known defects, to see every output once before touching real data.
 
 ## Layout
 
 ```
 SKILL.md                             the method: workflow, severity scale, traps
 references/
-  issue-catalogue.md                 the fourteen checks, with DICOM references
-  terminology.md                     judging codes; SNOMED flavours; laterality
+  issue-catalogue.md                 the seventeen checks, with DICOM references
+  terminology.md                     which sequence carries the anatomy; judging codes;
+                                     the review table; SNOMED flavours; laterality
   reporting.md                       writing the report and the triage list
   access-bigquery.md                 path 1 — metadata table
   access-dicomweb.md                 path 2 — QIDO + WADO
@@ -65,51 +80,17 @@ scripts/
   seg_checks.py                      run the computed checks + triage roll-up
   dciodvfy_check.py                  validate objects against the IOD with dciodvfy
   seg_encoding.py                    empty frames + compression, from the objects
-  cielab.py                          DICOM's CIELab: parse, compare, draw a swatch
-  dcmterm.py                         check codes against the code set DICOM uses
+  dcmterm.py                         codes against DICOM's own code set and context groups
   lookup_codes.py                    resolve codes to fully specified names
-  sql/                               the same checks as BigQuery templates, 01–15
+  cielab.py                          DICOM's CIELab: parse, compare, draw a swatch
+  make_fixture.py                    a synthetic five-file delivery with known defects
+  sql/                               the same checks as BigQuery templates, 01–17
+templates/
+  review.csv                         the curated verdict table's header, with two examples
 tests/
-  test_seg_review.py                 109 tests over the extraction and check logic
+  test_seg_review.py                 151 tests over the extraction and check logic
+requirements.txt                     every optional dependency
 ```
-
-## Usage
-
-```bash
-# 1. Extract (pick a source)
-python scripts/seg_attributes.py --files /path/to/delivery -o seg_attributes.csv
-python scripts/seg_attributes.py --dicomweb <url-or-store> --gcp -o seg_attributes.csv
-
-# 2. Computed checks + per-series triage
-python scripts/seg_checks.py seg_attributes.csv --outdir findings/
-
-#    IOD conformance, where the files are on disk
-pip install dicom3tools
-python scripts/dciodvfy_check.py --files /path/to/delivery -o findings/
-
-#    Empty frames + compression, also files only. Measures what deflate would save.
-python scripts/seg_encoding.py --files /path/to/delivery -o findings/
-
-# 3. Coverage gap + meaning disagreements against DICOM's own code set
-python scripts/dcmterm.py coverage seg_attributes.csv -o findings/coverage.csv
-
-# 4. Fully specified names for every anatomic code, and "Entire X" detection
-python scripts/lookup_codes.py seg_attributes.csv -o findings/codes.csv
-python scripts/dcmterm.py suggest findings/codes.csv -o findings/entire_flavour.csv
-
-# 5. Re-run with the IOD and encoding verdicts and the curated verdicts folded in
-python scripts/seg_checks.py seg_attributes.csv --codes findings/codes.csv \
-    --review review.csv --iod findings/issue9_iod_validation.csv \
-    --encoding findings/encoding_per_object.csv --outdir findings/
-```
-
-Step 2 also produces the display-colour palette (`issue13_color_palette.csv`, plus a
-paste-ready `.md` with an SVG swatch per row) and the algorithm-identification check,
-on every access path.
-
-For BigQuery, deploy `scripts/sql/01_seg_attributes.sql` as a view and run `02`–`15`
-against it. See `references/access-bigquery.md`. Issues 9, 11 and 12 have no SQL
-form — they need the objects.
 
 ## Dependencies
 
@@ -117,13 +98,14 @@ form — they need the objects.
 |---|---|
 | `seg_checks.py`, `lookup_codes.py`, `cielab.py` | standard library only |
 | `dcmterm.py` | any one of `pyarrow`, `duckdb` or `pandas`, to read Parquet |
-| `seg_attributes.py --files` | `pydicom>=3.0` |
+| `seg_attributes.py --files`, `seg_encoding.py`, `make_fixture.py`, the tests | `pydicom>=3.0` |
 | `dciodvfy_check.py` | `dicom3tools` (for `dciodvfy`) and `pydicom>=3.0` |
-| `seg_encoding.py` | `pydicom>=3.0`. No pixel-data codec and no numpy: frames are scanned as bytes, and Deflated Image Frame Compression is un-deflated in-process |
 | `seg_attributes.py --dicomweb` | `dicomweb-client>=0.59`, plus `[gcp]` and `google-auth` for Healthcare API stores |
 | `scripts/sql/` | the `bq` CLI |
 | `lookup_codes.py` | network access to `tx.fhir.org` (public, no auth) |
-| `dcmterm.py` | one download from [fedorov/dcmterms](https://github.com/fedorov/dcmterms) (public, ~0.5 MB, cached) |
+| `dcmterm.py` | one download from [fedorov/dcmterms](https://github.com/fedorov/dcmterms) (public, ~1 MB, cached) |
+
+`seg_encoding.py` needs no pixel-data codec and no numpy: frames are scanned as bytes.
 
 ## External authorities
 
@@ -133,31 +115,27 @@ or one build, on one day:
 
 | | |
 |---|---|
-| [**dcmterms**](https://github.com/fedorov/dcmterms) | every coded entry in DICOM PS3.16's context groups, as Parquet — what DICOM *expects*, and the evidence behind the "Entire X" finding |
+| [**dcmterms**](https://github.com/fedorov/dcmterms) | every coded entry in DICOM PS3.16's context groups, and how the groups include one another, as Parquet — what DICOM *expects* |
 | [**tx.fhir.org**](https://tx.fhir.org) | all of SNOMED CT — fully specified names, retired concepts, everything dcmterms does not cover |
 | [**dicom3tools**](https://github.com/ImagingDataCommons/dicom3tools-python-distributions) | `dciodvfy`, David Clunie's IOD validator — structure against PS3.3. It checks no context group, so it says nothing about whether the coding is right |
 
 The first two are the terminology pair, and neither alone is enough: a review that
-joins only dcmterms **silently passes everything it does not cover**, which can be
-most of a batch. See "The coverage trap" in `SKILL.md`. The third is orthogonal to
-both — it answers a different question entirely.
+joins only dcmterms **silently passes everything it does not cover**. See "The coverage
+trap" in `SKILL.md`. The third is orthogonal to both.
 
 ## Verification
 
-`python tests/test_seg_review.py` — 109 tests covering extraction (Background
-segments, multi-valued code sequences, both laterality modifier sequences, absent
-attributes), the check logic (ambiguity scope classification, Type 1 conformance,
-TrackingUID sharing patterns, retired coding schemes, triage severity and ordering),
-colour (the C.10.7.1.1 scaling, sRGB round trips against independently computed
-values, duplicate versus confusable versus same-structure, the PALETTE COLOR rule),
-algorithm identification (Type 1C only where not MANUAL, informative versus not),
-empty frames (including the mid-byte frame boundaries a byte-sliced implementation
-gets wrong, and encapsulated fragments, where the rule is the opposite), the
-terminology comparison (meaning agreement, the private-scheme and coverage-gap split,
-"Entire X" replacement matching) and the `dciodvfy -new` output parser (message
-grammar, segment and frame attribution, severity mapping). The terminology tests run
-against a stub table and the validator tests against captured output, so the suite
-needs neither network, nor dicom3tools, nor a fixture file.
+```bash
+pip install pydicom          # the only thing the suite needs
+python tests/test_seg_review.py
+```
+
+151 tests over extraction, the check logic, colour, algorithm identification, empty
+frames, the terminology comparison, context-group membership, segment numbering,
+frame-of-reference integrity, the review-table contract, the `dciodvfy -new`
+output parser and the guard against a dciodvfy build that rejects its flags. Terminology tests run against a stub table and validator tests against
+captured output, so the suite needs neither network, nor dicom3tools, nor fixture
+files.
 
 ## Scope
 
@@ -165,12 +143,7 @@ DICOM SEG only. RTSTRUCT has a different structure and different failure modes.
 
 **The boundary is what the voxels mean.** Nothing here interprets what was segmented,
 so it will not tell you whether a segmentation is anatomically correct — only whether
-the object says what it means. Two checks read the pixel data without needing to know
-any anatomy: issue 9 checks that `PixelData` is the length the metadata declares,
-catching a truncated or mis-framed object, and issue 11 asks only whether each frame
-is entirely zero. Everything else works from metadata alone.
-
-Structure and semantics are checked separately and neither substitutes for the other.
+the object says what it means. Structure and semantics are checked separately:
 `dciodvfy` decides whether the object conforms to the IOD; the terminology work decides
 whether the codes mean what the labels say. A batch can pass one comprehensively and
 fail the other.

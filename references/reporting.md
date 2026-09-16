@@ -72,6 +72,17 @@ That sentence is what a busy reader takes away.
   version — conformant, and still the reason nobody can say which model version
   produced the delivery). A reader who cannot tell which is which will either
   over- or under-react to both.
+- For issues 1, 2, 3 and 8, say **which sequence** each finding sits in
+  (`codeSequence`), and open the terminology section with which sequence carries
+  the anatomy in this batch. A reader sent to `AnatomicRegionSequence` on a batch
+  that codes organs as the property type finds an empty column.
+- For issue 15, report **pairings**, not segments: one row per distinct
+  `(category, type)` is what the producer changes. Keep the Medium
+  (`TYPE_OUTSIDE_CATEGORY`, the two Type 1 attributes contradict each other) apart
+  from the two Lows (baseline membership, which is not conformance).
+- For issue 17, state whether the referenced series were **resolved at all**. An
+  empty `referencedFrameOfReferenceUID` column means the check did not run, and
+  "no Frame of Reference findings" on such a batch is a false reassurance.
 - Any **reassuring negative** the check establishes. "No TrackingUID is shared across
   patients, and none is repeated within a series" bounds the problem and lets a reader
   respond proportionately. A report that lists only what is broken cannot be acted on.
@@ -168,7 +179,7 @@ One row per SEG series, sorted worst-first, CSV in version control.
 | Column | |
 |---|---|
 | `PatientID`, `StudyInstanceUID`, `SeriesInstanceUID` | First three, so the row is identifiable |
-| `issues` | Semicolon-separated tags, most severe first |
+| `issues` | Semicolon-separated tags, most severe first. A segment offending in two code sequences counts once |
 | `worstSeverity` | High / Medium / Low / None |
 | `segmentCount` | |
 | `segmentsNeedingRecode` | **The work queue** — segments needing a per-segment human decision |
@@ -199,6 +210,11 @@ COLOR_DUPLICATE            Medium    issue 13
 COLOR_NOT_PERMITTED        Medium    issue 13
 COLOR_MALFORMED            Medium    issue 13
 ALGORITHM_NAME_MISSING     Medium    issue 14
+TYPE_OUTSIDE_CATEGORY      Medium    issue 15 - needs dcmterm.py property
+SEGMENT_NUMBER_DUPLICATE   Medium    issue 16
+SEGMENT_NUMBER_NOT_SEQUENTIAL Medium issue 16
+FRAME_OF_REFERENCE_MISMATCH Medium   issue 17 - needs the references resolved
+REFERENCED_SERIES_MISSING  Medium    issue 17 - needs the references resolved
 COSMETIC_VARIANT           Low       issue 2
 IOD_WARNING                Low       issue 9 - local files only
 CODE_MEANING_SPELLING      Low       issue 1
@@ -210,20 +226,28 @@ COLOR_CONFUSABLE           Low       issue 13
 COLOR_INCONSISTENT         Low       issue 13
 COLOR_ABSENT               Low       issue 13
 ALGORITHM_UNIDENTIFIED     Low       issue 14
+TYPE_NOT_IN_CID            Low       issue 15 - needs dcmterm.py property
+CATEGORY_NOT_IN_CID        Low       issue 15 - needs dcmterm.py property
 CODE_AMBIGUOUS_ELSEWHERE   context   issue 2 — does NOT raise worstSeverity
 ```
 
 `scripts/seg_checks.py` and `scripts/sql/12_series_triage.sql` emit the same tags,
-with one class of exception: the six tags marked *local files only* come from the
-objects rather than from a metadata table. `IOD_ERROR` / `IOD_WARNING` need
-`dciodvfy` (issue 9); `EMPTY_SEGMENT` / `EMPTY_FRAMES_RETAINED` need the pixel data
-(issue 11); `UNCOMPRESSED` / `LOSSY_COMPRESSED` need the file meta group, which a
-BigQuery export drops and a DICOMweb metadata response does not return (issue 12). A
-triage list built on BigQuery is **silent** about all six. Say that in the report
-rather than letting the silence read as a pass.
+with three classes of exception, each a check that a given path may not have run:
 
-`seg_checks.py` prints which of them ran. Six tags absent because the check did not
-run looks identical, in a CSV, to six tags absent because nothing was wrong.
+- The six tags marked *local files only* come from the objects. `IOD_ERROR` /
+  `IOD_WARNING` need `dciodvfy` (issue 9); `EMPTY_SEGMENT` / `EMPTY_FRAMES_RETAINED`
+  need the pixel data (issue 11); `UNCOMPRESSED` / `LOSSY_COMPRESSED` need the file
+  meta group, which a BigQuery export drops and a DICOMweb metadata response does
+  not return (issue 12).
+- The three issue 15 tags need `dcmterm.py property` and `--property`; the SQL
+  roll-up never emits them.
+- The two issue 17 tags need the referenced series resolved: always on BigQuery,
+  only with `--resolve-referenced` on the other two paths.
+
+A triage list built without one of these is **silent** about it, not clean.
+`seg_checks.py` prints which checks ran; repeat that in the report, because a tag
+absent because the check did not run looks identical, in a CSV, to a tag absent
+because nothing was wrong.
 
 `COSMETIC_VARIANT` differs in how it is decided: the SQL reads a curated code list,
 while the script offers near-match candidates (`cosmeticCandidate` in

@@ -12,6 +12,11 @@
 # Fill entireFlavourCodes and cosmeticCodes below from 07_entire_code_flavour.sql
 # and from your reading of 02_ambiguous_code.sql. Everything else is computed.
 #
+# The code-level issues (1, 2, 3, 8) are judged over the anatomic region, the
+# segmented property type AND the segmented property category - see the
+# `codes` CTE, identical to the one in 02 - and counted once per SEGMENT
+# however many of its sequences offend: the segment is the unit of work.
+#
 # @@DELTA_E@@ is issue 13's confusability threshold in dE*ab; use the same value
 # here as in 14_recommended_color.sql, or the two will disagree.
 
@@ -32,39 +37,134 @@ WITH
     SELECT * FROM UNNEST(['12003004']) AS code
   ),
 
-  # Issue 2. Ambiguity is a property of a CODE across the whole population, so
-  # the tags below separate what is evidence about a series from what is not.
-  ambiguousCodes AS (
-    SELECT AnatomicRegionCodeValue AS code
-    FROM `@@SEG_ATTRIBUTES@@`
+  # One row per (segment, code sequence) - identical to the CTE in 02.
+  codes AS (
+    SELECT seg.*, 'AnatomicRegion' AS codeSequence,
+      AnatomicRegionCodingSchemeDesignator AS CodingSchemeDesignator,
+      AnatomicRegionCodeValue AS CodeValue,
+      AnatomicRegionCodeMeaning AS CodeMeaning
+    FROM `@@SEG_ATTRIBUTES@@` AS seg
     WHERE AnatomicRegionCodeValue IS NOT NULL AND NOT isBackgroundSegment
-    GROUP BY code
-    HAVING COUNT(DISTINCT AnatomicRegionCodeMeaning) > 1
+    UNION ALL
+    SELECT seg.*, 'SegmentedPropertyType',
+      SegmentedPropertyTypeCodingSchemeDesignator,
+      SegmentedPropertyTypeCodeValue,
+      SegmentedPropertyTypeCodeMeaning
+    FROM `@@SEG_ATTRIBUTES@@` AS seg
+    WHERE SegmentedPropertyTypeCodeValue IS NOT NULL AND NOT isBackgroundSegment
+    UNION ALL
+    SELECT seg.*, 'SegmentedPropertyCategory',
+      SegmentedPropertyCategoryCodingSchemeDesignator,
+      SegmentedPropertyCategoryCodeValue,
+      SegmentedPropertyCategoryCodeMeaning
+    FROM `@@SEG_ATTRIBUTES@@` AS seg
+    WHERE SegmentedPropertyCategoryCodeValue IS NOT NULL AND NOT isBackgroundSegment
+  ),
+
+  # Issue 2. Ambiguity is a property of a CODE IN ONE ROLE across the whole
+  # population, so the tags below separate what is evidence about a series
+  # from what is not.
+  ambiguousCodes AS (
+    SELECT codeSequence, CodeValue
+    FROM codes
+    GROUP BY codeSequence, CodeValue
+    HAVING COUNT(DISTINCT CodeMeaning) > 1
   ),
 
   dominantMeaning AS (
-    SELECT code, meaning AS dominant
+    SELECT codeSequence, CodeValue, CodeMeaning AS dominant
     FROM (
       SELECT
-        AnatomicRegionCodeValue AS code,
-        AnatomicRegionCodeMeaning AS meaning,
+        codeSequence,
+        CodeValue,
+        CodeMeaning,
         ROW_NUMBER() OVER (
-          PARTITION BY AnatomicRegionCodeValue
-          ORDER BY COUNT(*) DESC, AnatomicRegionCodeMeaning) AS rn
-      FROM `@@SEG_ATTRIBUTES@@`
-      WHERE AnatomicRegionCodeValue IS NOT NULL AND NOT isBackgroundSegment
-      GROUP BY code, meaning)
+          PARTITION BY codeSequence, CodeValue
+          ORDER BY COUNT(*) DESC, CodeMeaning) AS rn
+      FROM codes
+      GROUP BY codeSequence, CodeValue, CodeMeaning)
     WHERE rn = 1
   ),
 
   selfInconsistentSeries AS (
     SELECT DISTINCT SeriesInstanceUID
     FROM (
-      SELECT SeriesInstanceUID, AnatomicRegionCodeValue
-      FROM `@@SEG_ATTRIBUTES@@`
-      WHERE AnatomicRegionCodeValue IS NOT NULL AND NOT isBackgroundSegment
-      GROUP BY SeriesInstanceUID, AnatomicRegionCodeValue
-      HAVING COUNT(DISTINCT AnatomicRegionCodeMeaning) > 1)
+      SELECT SeriesInstanceUID, codeSequence, CodeValue
+      FROM codes
+      GROUP BY SeriesInstanceUID, codeSequence, CodeValue
+      HAVING COUNT(DISTINCT CodeMeaning) > 1)
+  ),
+
+  # Issues 1, 2, 3 and 8 per (segment, sequence).
+  codeRows AS (
+    SELECT
+      codes.SOPInstanceUID,
+      codes.SegmentNumber,
+      codes.CodeValue,
+      codes.CodeMeaning,
+      EXISTS (SELECT 1 FROM review r
+              WHERE r.CodeValue = codes.CodeValue
+                AND r.CodingSchemeDesignator = codes.CodingSchemeDesignator
+                AND r.meaningRecorded = codes.CodeMeaning
+                AND (r.codeSequence IS NULL OR r.codeSequence = codes.codeSequence)
+                AND r.verdict = 'INVERTED') AS isLateralityInverted,
+      EXISTS (SELECT 1 FROM review r
+              WHERE r.CodeValue = codes.CodeValue
+                AND r.CodingSchemeDesignator = codes.CodingSchemeDesignator
+                AND r.meaningRecorded = codes.CodeMeaning
+                AND (r.codeSequence IS NULL OR r.codeSequence = codes.codeSequence)
+                AND r.issue = 1
+                AND r.verdict IN ('WRONG_ANATOMY', 'NARROWER_OR_BROADER'))
+        AS isAnatomyConflict,
+      EXISTS (SELECT 1 FROM review r
+              WHERE r.CodeValue = codes.CodeValue
+                AND r.CodingSchemeDesignator = codes.CodingSchemeDesignator
+                AND r.meaningRecorded = codes.CodeMeaning
+                AND (r.codeSequence IS NULL OR r.codeSequence = codes.codeSequence)
+                AND r.verdict = 'UNCODED') AS isLateralityUncoded,
+      EXISTS (SELECT 1 FROM review r
+              WHERE r.CodeValue = codes.CodeValue
+                AND r.CodingSchemeDesignator = codes.CodingSchemeDesignator
+                AND r.meaningRecorded = codes.CodeMeaning
+                AND (r.codeSequence IS NULL OR r.codeSequence = codes.codeSequence)
+                AND r.verdict = 'SPELLING') AS isSpellingVariant,
+      codes.SeriesInstanceUID IN (SELECT SeriesInstanceUID FROM selfInconsistentSeries)
+        AS isSelfInconsistent,
+      ambiguousCodes.CodeValue IS NOT NULL AS isCodeAmbiguousSomewhere,
+      ambiguousCodes.CodeValue IS NOT NULL
+        AND codes.CodeMeaning != dominantMeaning.dominant AS isMinorityMeaning,
+      codes.CodeValue IN (SELECT code FROM entireFlavourCodes) AS isEntireFlavour,
+      codes.CodeValue IN (SELECT code FROM cosmeticCodes) AS isCosmetic
+    FROM codes
+    LEFT JOIN ambiguousCodes
+      ON ambiguousCodes.codeSequence = codes.codeSequence
+      AND ambiguousCodes.CodeValue = codes.CodeValue
+    LEFT JOIN dominantMeaning
+      ON dominantMeaning.codeSequence = codes.codeSequence
+      AND dominantMeaning.CodeValue = codes.CodeValue
+  ),
+
+  # ...folded back to one row per SEGMENT: a liver coded as bowel in both the
+  # region and the type is one segment to recode, not two.
+  codeFlags AS (
+    SELECT
+      SOPInstanceUID,
+      SegmentNumber,
+      LOGICAL_OR(isLateralityInverted) AS isLateralityInverted,
+      LOGICAL_OR(isAnatomyConflict) AS isAnatomyConflict,
+      LOGICAL_OR(isLateralityUncoded) AS isLateralityUncoded,
+      LOGICAL_OR(isSpellingVariant) AS isSpellingVariant,
+      LOGICAL_OR(isSelfInconsistent) AS isSelfInconsistent,
+      LOGICAL_OR(isCodeAmbiguousSomewhere) AS isCodeAmbiguousSomewhere,
+      LOGICAL_OR(isMinorityMeaning) AS isMinorityMeaning,
+      LOGICAL_OR(isEntireFlavour) AS isEntireFlavour,
+      LOGICAL_OR(isCosmetic) AS isCosmetic,
+      STRING_AGG(
+        DISTINCT IF(isAnatomyConflict OR isLateralityInverted,
+                    CONCAT(CodeValue, ' "', CodeMeaning, '"'), NULL),
+        '; ') AS offendingCodes
+    FROM codeRows
+    GROUP BY SOPInstanceUID, SegmentNumber
   ),
 
   # Issue 7, the unclear case only: a UID reused between two series of one study.
@@ -145,32 +245,36 @@ WITH
     HAVING COUNT(DISTINCT RecommendedDisplayCIELabValue) > 1
   ),
 
+  # Issue 16, per object. Background rows are deliberately INCLUDED: a
+  # LABELMAP's 0 is legitimate and a BINARY object's 0 is the defect. See
+  # 16_segment_numbers.sql.
+  segmentNumbering AS (
+    SELECT
+      SOPInstanceUID,
+      COUNTIF(SegmentNumber IS NOT NULL) > COUNT(DISTINCT SegmentNumber)
+        AS hasDuplicateNumber,
+      ANY_VALUE(SegmentationType) IN ('BINARY', 'FRACTIONAL')
+        AND COUNT(DISTINCT SegmentNumber) > 0
+        AND (MIN(SegmentNumber) != 1
+             OR MAX(SegmentNumber) != COUNT(DISTINCT SegmentNumber))
+        AS isNotSequential
+    FROM `@@SEG_ATTRIBUTES@@`
+    GROUP BY SOPInstanceUID
+  ),
+
   flagged AS (
     SELECT
       seg.*,
-      EXISTS (SELECT 1 FROM review r
-              WHERE r.CodeValue = seg.AnatomicRegionCodeValue
-                AND r.meaningRecorded = seg.AnatomicRegionCodeMeaning
-                AND r.verdict = 'INVERTED') AS isLateralityInverted,
-      EXISTS (SELECT 1 FROM review r
-              WHERE r.CodeValue = seg.AnatomicRegionCodeValue
-                AND r.meaningRecorded = seg.AnatomicRegionCodeMeaning
-                AND r.issue = 1
-                AND r.verdict IN ('WRONG_ANATOMY', 'NARROWER_OR_BROADER'))
-        AS isAnatomyConflict,
-      EXISTS (SELECT 1 FROM review r
-              WHERE r.CodeValue = seg.AnatomicRegionCodeValue
-                AND r.meaningRecorded = seg.AnatomicRegionCodeMeaning
-                AND r.verdict = 'UNCODED') AS isLateralityUncoded,
-      seg.SeriesInstanceUID IN (
-        SELECT SeriesInstanceUID FROM selfInconsistentSeries)
-        AS isSelfInconsistent,
-      seg.AnatomicRegionCodeMeaning != dominantMeaning.dominant
-        AS isMinorityMeaning,
-      seg.AnatomicRegionCodeValue IN (SELECT code FROM ambiguousCodes)
-        AS isCodeAmbiguousSomewhere,
-      seg.AnatomicRegionCodeValue IN (SELECT code FROM entireFlavourCodes)
-        AS isEntireFlavour,
+      IFNULL(codeFlags.isLateralityInverted, FALSE) AS isLateralityInverted,
+      IFNULL(codeFlags.isAnatomyConflict, FALSE) AS isAnatomyConflict,
+      IFNULL(codeFlags.isLateralityUncoded, FALSE) AS isLateralityUncoded,
+      IFNULL(codeFlags.isSelfInconsistent, FALSE) AS isSelfInconsistent,
+      IFNULL(codeFlags.isMinorityMeaning, FALSE) AS isMinorityMeaning,
+      IFNULL(codeFlags.isCodeAmbiguousSomewhere, FALSE) AS isCodeAmbiguousSomewhere,
+      IFNULL(codeFlags.isEntireFlavour, FALSE) AS isEntireFlavour,
+      IFNULL(codeFlags.isSpellingVariant, FALSE) AS isSpellingVariant,
+      IFNULL(codeFlags.isCosmetic, FALSE) AS isCosmetic,
+      codeFlags.offendingCodes,
       seg.SegmentNumber IS NULL
         OR seg.SegmentLabel IS NULL
         OR seg.SegmentedPropertyCategoryCodeValue IS NULL
@@ -191,12 +295,6 @@ WITH
         AS isTrackingAmbiguous,
       seg.TrackingUID IN (SELECT TrackingUID FROM crossPatientTrackingUIDs)
         AS isTrackingCrossPatient,
-      EXISTS (SELECT 1 FROM review r
-              WHERE r.CodeValue = seg.AnatomicRegionCodeValue
-                AND r.meaningRecorded = seg.AnatomicRegionCodeMeaning
-                AND r.verdict = 'SPELLING') AS isSpellingVariant,
-      seg.AnatomicRegionCodeValue IN (SELECT code FROM cosmeticCodes)
-        AS isCosmetic,
       seg.SegmentedPropertyTypeCodeValue = seg.SegmentedPropertyCategoryCodeValue
         AS isTypeRepeatsCategory,
       seg.SegmentsOverlap IS NULL AS isNoSegmentsOverlap,
@@ -237,15 +335,31 @@ WITH
       UPPER(IFNULL(seg.SegmentAlgorithmType, '')) IN ('AUTOMATIC', 'SEMIAUTOMATIC')
         AND (NOT IFNULL(seg.hasAlgorithmIdentification, FALSE)
              OR seg.AlgorithmVersion IS NULL
-             OR TRIM(seg.AlgorithmVersion) = '') AS isAlgorithmUnidentified
+             OR TRIM(seg.AlgorithmVersion) = '') AS isAlgorithmUnidentified,
+      # Issue 16. See 16_segment_numbers.sql.
+      IFNULL(segmentNumbering.hasDuplicateNumber, FALSE) AS isSegmentNumberDuplicate,
+      IFNULL(segmentNumbering.isNotSequential, FALSE) AS isSegmentNumberNotSequential,
+      # Issue 17. See 17_frame_of_reference.sql. Both are FALSE, not NULL,
+      # where the referenced series was never resolved - silence, not a pass.
+      seg.referencedSeriesInstanceUID IS NOT NULL
+        AND IFNULL(seg.referencedSeriesFound, TRUE) = FALSE
+        AS isReferencedSeriesMissing,
+      seg.referencedFrameOfReferenceUID IS NOT NULL
+        AND seg.FrameOfReferenceUID != seg.referencedFrameOfReferenceUID
+        AS isFrameOfReferenceMismatch
     FROM
       `@@SEG_ATTRIBUTES@@` AS seg
     LEFT JOIN
-      dominantMeaning ON dominantMeaning.code = seg.AnatomicRegionCodeValue
+      codeFlags
+      ON codeFlags.SOPInstanceUID = seg.SOPInstanceUID
+      AND codeFlags.SegmentNumber = seg.SegmentNumber
     LEFT JOIN
       colourCollisions
       ON colourCollisions.SOPInstanceUID = seg.SOPInstanceUID
       AND colourCollisions.SegmentNumber = seg.SegmentNumber
+    LEFT JOIN
+      segmentNumbering
+      ON segmentNumbering.SOPInstanceUID = seg.SOPInstanceUID
     WHERE
       NOT seg.isBackgroundSegment
   ),
@@ -281,14 +395,12 @@ WITH
       COUNTIF(isColorAbsent) AS nColorAbsent,
       COUNTIF(isAlgorithmNameMissing) AS nAlgorithmNameMissing,
       COUNTIF(isAlgorithmUnidentified) AS nAlgorithmUnidentified,
-      STRING_AGG(
-        DISTINCT
-        IF(isAnatomyConflict OR isLateralityInverted,
-           CONCAT(AnatomicRegionCodeValue, ' "', AnatomicRegionCodeMeaning, '"'),
-           NULL),
-        '; ' ORDER BY IF(isAnatomyConflict OR isLateralityInverted,
-           CONCAT(AnatomicRegionCodeValue, ' "', AnatomicRegionCodeMeaning, '"'),
-           NULL)) AS offendingCodes
+      LOGICAL_OR(isSegmentNumberDuplicate) AS anySegmentNumberDuplicate,
+      LOGICAL_OR(isSegmentNumberNotSequential) AS anySegmentNumberNotSequential,
+      LOGICAL_OR(isReferencedSeriesMissing) AS anyReferencedSeriesMissing,
+      LOGICAL_OR(isFrameOfReferenceMismatch) AS anyFrameOfReferenceMismatch,
+      STRING_AGG(DISTINCT offendingCodes, '; ' ORDER BY offendingCodes)
+        AS offendingCodes
     FROM flagged
     GROUP BY PatientID, StudyInstanceUID, SeriesInstanceUID
   )
@@ -323,6 +435,10 @@ SELECT
   #   COLOR_NOT_PERMITTED      (Medium) 14_recommended_color.sql
   #   COLOR_MALFORMED          (Medium) 14_recommended_color.sql
   #   ALGORITHM_NAME_MISSING   (Medium) 15_algorithm_identification.sql
+  #   SEGMENT_NUMBER_DUPLICATE (Medium) 16_segment_numbers.sql
+  #   SEGMENT_NUMBER_NOT_SEQUENTIAL (Medium) 16_segment_numbers.sql
+  #   FRAME_OF_REFERENCE_MISMATCH (Medium) 17_frame_of_reference.sql
+  #   REFERENCED_SERIES_MISSING (Medium) 17_frame_of_reference.sql
   #   COSMETIC_VARIANT         (Low)    02_ambiguous_code.sql
   #   CODE_MEANING_SPELLING    (Low)    05_anatomy_conflict.sql
   #   TYPE_REPEATS_CATEGORY    (Low)    09_type_repeats_category.sql
@@ -331,15 +447,19 @@ SELECT
   #   COLOR_INCONSISTENT       (Low)    14_recommended_color.sql
   #   COLOR_ABSENT             (Low)    14_recommended_color.sql
   #   ALGORITHM_UNIDENTIFIED   (Low)    15_algorithm_identification.sql
-  # Four tags are deliberately ABSENT here, because the queries that would
-  # produce them cannot run on a metadata table:
+  # Tags deliberately ABSENT here, because the checks that would produce them
+  # cannot run on a metadata table alone:
   #   IOD_ERROR / IOD_WARNING            issue 9, from dciodvfy
   #   EMPTY_SEGMENT / EMPTY_FRAMES_RETAINED   issue 11, from the pixel data
   #   UNCOMPRESSED / LOSSY_COMPRESSED    issue 12, from the file meta group
-  # All three checks need the objects. scripts/seg_checks.py adds them on the
-  # local-files path, via --iod and --encoding. A triage list built from this
-  # query is SILENT about IOD conformance and about how the objects are
-  # encoded; say so rather than letting the silence read as a pass.
+  #   TYPE_OUTSIDE_CATEGORY / TYPE_NOT_IN_CID / CATEGORY_NOT_IN_CID
+  #                                      issue 15, from dcmterms' context-group
+  #                                      tables - export the per-segment view
+  #                                      and run scripts/dcmterm.py property
+  # The first three need the objects; scripts/seg_checks.py adds them on the
+  # local-files path via --iod and --encoding, and issue 15 on every path via
+  # --property. A triage list built from this query alone is SILENT about all
+  # of them; say so rather than letting the silence read as a pass.
   #
   #   CODE_AMBIGUOUS_ELSEWHERE (context) a code this series uses is used with
   #     another meaning by some OTHER series. No evidence this series is wrong,
@@ -361,6 +481,10 @@ SELECT
         IF(nColorNotPermitted > 0, 'COLOR_NOT_PERMITTED', NULL),
         IF(nColorMalformed > 0, 'COLOR_MALFORMED', NULL),
         IF(nAlgorithmNameMissing > 0, 'ALGORITHM_NAME_MISSING', NULL),
+        IF(anySegmentNumberDuplicate, 'SEGMENT_NUMBER_DUPLICATE', NULL),
+        IF(anySegmentNumberNotSequential, 'SEGMENT_NUMBER_NOT_SEQUENTIAL', NULL),
+        IF(anyFrameOfReferenceMismatch, 'FRAME_OF_REFERENCE_MISMATCH', NULL),
+        IF(anyReferencedSeriesMissing, 'REFERENCED_SERIES_MISSING', NULL),
         IF(nCosmetic > 0, 'COSMETIC_VARIANT', NULL),
         IF(nSpellingVariant > 0, 'CODE_MEANING_SPELLING', NULL),
         IF(nTypeRepeatsCategory > 0, 'TYPE_REPEATS_CATEGORY', NULL),
@@ -383,7 +507,9 @@ SELECT
       OR nTrackingCrossPatient > 0 THEN 'High'
     WHEN nLateralityUncoded > 0 OR nMalformed > 0 OR nTrackingAmbiguous > 0
       OR nEntireFlavour > 0 OR nColorDuplicate > 0 OR nColorNotPermitted > 0
-      OR nColorMalformed > 0 OR nAlgorithmNameMissing > 0 THEN 'Medium'
+      OR nColorMalformed > 0 OR nAlgorithmNameMissing > 0
+      OR anySegmentNumberDuplicate OR anySegmentNumberNotSequential
+      OR anyFrameOfReferenceMismatch OR anyReferencedSeriesMissing THEN 'Medium'
     WHEN nCosmetic > 0 OR nSpellingVariant > 0 OR nTypeRepeatsCategory > 0
       OR anyNoSegmentsOverlap OR nColorConfusable > 0 OR nColorInconsistent > 0
       OR nColorAbsent > 0 OR nAlgorithmUnidentified > 0 THEN 'Low'

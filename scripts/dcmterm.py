@@ -44,12 +44,13 @@ from collections import defaultdict
 from pathlib import Path
 
 DATA_BASE = "https://raw.githubusercontent.com/fedorov/dcmterms/main/docs/data"
-PARQUET = ("codes_unique.parquet", "coded_entries.parquet")
+PARQUET = ("codes_unique.parquet", "coded_entries.parquet", "context_groups.parquet")
 PROVENANCE = ("extraction_metadata.json", "version.json")
 
 COVERAGE_COLUMNS = [
     "CodingSchemeDesignator",
     "CodeValue",
+    "codeSequences",
     "meaningsInBatch",
     "distinctMeanings",
     "segments",
@@ -59,6 +60,47 @@ COVERAGE_COLUMNS = [
     "dcmMeanings",
     "meaningAgrees",
     "numCids",
+    "cids",
+]
+
+# The code sequences `coverage` reads by default. The anatomic region is Type 3
+# and the other two Type 1, so on many deliveries the organ is the TYPE code
+# and the region is absent; a coverage figure computed on the region alone
+# would then describe an empty column.
+DEFAULT_COLUMNS = [
+    "AnatomicRegionCodeValue",
+    "SegmentedPropertyTypeCodeValue",
+    "SegmentedPropertyCategoryCodeValue",
+]
+
+# Issue 15. PS3.3 Table C.8.20-4 gives the Segmented Property Category Code
+# Sequence (0062,0003) BCID 7150 and the Segmented Property Type Code Sequence
+# (0062,000F) BCID 7151. Both are BASELINE, so a code outside them is
+# permitted - which is why membership alone is Low. CID 7150 additionally
+# names, per category, the context group its types come from (its
+# "Segmentation Property Type Context Group" column; dcmterms carries it as
+# context_group_cid), and a type outside the CID its own category names
+# contradicts the category - Medium.
+SEGMENTATION_PROPERTY_CATEGORY_CID = 7150
+SEGMENTATION_PROPERTY_TYPE_CID = 7151
+RETIRED_SCHEMES = {"SRT", "SNM3", "SNM", "99SDM"}
+
+PROPERTY_COLUMNS = [
+    "categoryScheme",
+    "categoryCode",
+    "categoryMeaning",
+    "typeScheme",
+    "typeCode",
+    "typeMeaning",
+    "segments",
+    "series",
+    "categoryInCid7150",
+    "typeInCid7151",
+    "categoryTypeCid",
+    "categoryTypeCidName",
+    "typeInCategoryCid",
+    "propertyIssue",
+    "note",
 ]
 
 # Columns named to match the entireFlavourCodes struct in sql/07.
@@ -197,23 +239,185 @@ def dcm_cids(cache):
     return table
 
 
-def batch_codes(table, value_column, scheme_column, meaning_column):
+def dcm_context_groups(cache):
+    """cid -> {"name", "includes": [cid, ...]} from context_groups.parquet.
+
+    `includes` is the CID's own "Include CID" lines, one level deep;
+    cid_members follows them transitively. CID 7151 is nothing BUT includes -
+    nine of them, each including more - so without this table the type
+    context group has no members at all.
+    """
+    groups = {}
+    for row in read_parquet(cache / "context_groups.parquet"):
+        number = int(row.get("cid_number") or 0)
+        if not number:
+            continue
+        includes = [int(c) for c in str(row.get("includes") or "").split(",")
+                    if c.strip().isdigit()]
+        groups[number] = {"name": (row.get("cid_name") or "").strip(),
+                          "includes": includes}
+    return groups
+
+
+def codes_by_cid(cache):
+    """(direct, links) from coded_entries.
+
+    direct: cid -> {(scheme, code)} of the entries listed IN that CID, before
+    includes. links: (cid, scheme, code) -> cid, the context group a coded
+    entry points at - CID 7150's "Segmentation Property Type Context Group"
+    column, which names the type CID each category draws on.
+    """
+    direct = defaultdict(set)
+    links = {}
+    for row in read_parquet(cache / "coded_entries.parquet"):
+        cid = int(row.get("cid_number") or 0)
+        scheme = (row.get("coding_scheme_designator") or "").strip()
+        value = (row.get("code_value") or "").strip()
+        if not cid or not value:
+            continue
+        direct[cid].add((scheme, value))
+        linked = row.get("context_group_cid")
+        if linked:
+            links[(cid, scheme, value)] = int(linked)
+    return direct, links
+
+
+def cid_members(cid, groups, direct, _seen=None):
+    """Every (scheme, code) in a context group, following Include CID transitively."""
+    seen = _seen if _seen is not None else set()
+    if cid in seen:
+        return set()
+    seen.add(cid)
+    members = set(direct.get(cid, ()))
+    for included in groups.get(cid, {}).get("includes", []):
+        members |= cid_members(included, groups, direct, seen)
+    return members
+
+
+def batch_codes(table, value_column, scheme_column=None, meaning_column=None):
     """Distinct codes in the batch, with what depends on each.
 
-    Same shape as lookup_codes.collect - Background segments excluded, since
-    they are an artefact of labelmap encoding rather than something segmented.
+    `value_column` is one CodeValue column or a list of them; the scheme and
+    meaning columns follow from the prefix unless given. A code used in two
+    sequences is one entry whose `sequences` names both. Same shape as
+    lookup_codes.collect - Background segments excluded, since they are an
+    artefact of labelmap encoding rather than something segmented.
     """
-    codes = defaultdict(lambda: {"meanings": set(), "segments": 0, "series": set()})
+    columns = [value_column] if isinstance(value_column, str) else list(value_column)
+    codes = defaultdict(lambda: {"meanings": set(), "segments": 0, "series": set(),
+                                 "sequences": set()})
     with open(table, newline="") as handle:
         for row in csv.DictReader(handle):
-            value = (row.get(value_column) or "").strip()
-            if not value or row.get("isBackgroundSegment") == "True":
+            if (row.get("isBackgroundSegment") or "").strip().lower() == "true":
                 continue
-            entry = codes[((row.get(scheme_column) or "").strip(), value)]
-            entry["meanings"].add((row.get(meaning_column) or "").strip())
-            entry["segments"] += 1
-            entry["series"].add(row.get("SeriesInstanceUID", ""))
+            for column in columns:
+                prefix = column.replace("CodeValue", "")
+                scheme_col = scheme_column if len(columns) == 1 and scheme_column \
+                    else f"{prefix}CodingSchemeDesignator"
+                meaning_col = meaning_column if len(columns) == 1 and meaning_column \
+                    else f"{prefix}CodeMeaning"
+                value = (row.get(column) or "").strip()
+                if not value:
+                    continue
+                entry = codes[((row.get(scheme_col) or "").strip(), value)]
+                entry["meanings"].add((row.get(meaning_col) or "").strip())
+                entry["segments"] += 1
+                entry["series"].add(row.get("SeriesInstanceUID", ""))
+                entry["sequences"].add(prefix)
     return codes
+
+
+def property_pairs(table):
+    """Distinct (category, type) pairings in the batch, with what depends on each."""
+    pairs = defaultdict(lambda: {"segments": 0, "series": set()})
+    columns = (
+        "SegmentedPropertyCategoryCodingSchemeDesignator",
+        "SegmentedPropertyCategoryCodeValue",
+        "SegmentedPropertyCategoryCodeMeaning",
+        "SegmentedPropertyTypeCodingSchemeDesignator",
+        "SegmentedPropertyTypeCodeValue",
+        "SegmentedPropertyTypeCodeMeaning",
+    )
+    with open(table, newline="") as handle:
+        for row in csv.DictReader(handle):
+            if (row.get("isBackgroundSegment") or "").strip().lower() == "true":
+                continue
+            pair = tuple((row.get(c) or "").strip() for c in columns)
+            if not pair[1] and not pair[4]:
+                continue
+            pairs[pair]["segments"] += 1
+            pairs[pair]["series"].add(row.get("SeriesInstanceUID", ""))
+    return pairs
+
+
+def property_check(pairs, groups, direct, links):
+    """Issue 15: each (category, type) pairing against its context groups.
+
+    Three findings, per pairing:
+      CATEGORY_NOT_IN_CID     the category is not in CID 7150. Baseline, so
+                              permitted; Low.
+      TYPE_NOT_IN_CID         the type is not in CID 7151 (transitively).
+                              Baseline, so permitted; Low.
+      TYPE_OUTSIDE_CATEGORY   the type IS a segmentation property type, but
+                              not one of the CID that its own category names
+                              in CID 7150 - "Anatomical Structure" over a
+                              lesion type, say. The two Type 1 attributes
+                              contradict each other; Medium.
+    Private (99...) and retired (SRT...) schemes are not judged here: the
+    first must be judged against whatever defines them, the second is issue 10.
+    """
+    categories = cid_members(SEGMENTATION_PROPERTY_CATEGORY_CID, groups, direct)
+    types = cid_members(SEGMENTATION_PROPERTY_TYPE_CID, groups, direct)
+    per_category = {}
+    rows = []
+    for (cs, cc, cm, ts, tc, tm), info in pairs.items():
+        issues, notes = [], []
+
+        def judgeable(scheme):
+            if is_private(scheme):
+                notes.append(f"{scheme}: private scheme - judge against its definition")
+                return False
+            if scheme in RETIRED_SCHEMES:
+                notes.append(f"{scheme}: retired scheme - issue 10; re-code first")
+                return False
+            return True
+
+        category_in = (cs, cc) in categories if cc else None
+        type_in = (ts, tc) in types if tc else None
+        category_cid = links.get((SEGMENTATION_PROPERTY_CATEGORY_CID, cs, cc))
+        type_in_category = None
+        if cc and judgeable(cs) and not category_in:
+            issues.append("CATEGORY_NOT_IN_CID")
+        if tc and judgeable(ts):
+            if not type_in:
+                issues.append("TYPE_NOT_IN_CID")
+            elif category_in and category_cid:
+                if category_cid not in groups:
+                    notes.append(f"CID {category_cid} is not in dcmterms; category/type "
+                                 "consistency not judged")
+                else:
+                    if category_cid not in per_category:
+                        per_category[category_cid] = cid_members(category_cid, groups, direct)
+                    type_in_category = (ts, tc) in per_category[category_cid]
+                    if not type_in_category:
+                        issues.append("TYPE_OUTSIDE_CATEGORY")
+        rows.append({
+            "categoryScheme": cs, "categoryCode": cc, "categoryMeaning": cm,
+            "typeScheme": ts, "typeCode": tc, "typeMeaning": tm,
+            "segments": info["segments"], "series": len(info["series"]),
+            "categoryInCid7150": "" if category_in is None else str(category_in),
+            "typeInCid7151": "" if type_in is None else str(type_in),
+            "categoryTypeCid": category_cid or "",
+            "categoryTypeCidName": groups.get(category_cid, {}).get("name", "")
+            if category_cid else "",
+            "typeInCategoryCid": "" if type_in_category is None else str(type_in_category),
+            "propertyIssue": "; ".join(issues),
+            "note": "; ".join(dict.fromkeys(notes)),
+        })
+    severity = {"TYPE_OUTSIDE_CATEGORY": 0, "TYPE_NOT_IN_CID": 1, "CATEGORY_NOT_IN_CID": 1}
+    return sorted(rows, key=lambda r: (
+        min((severity[i] for i in r["propertyIssue"].split("; ") if i), default=9),
+        -r["segments"], r["categoryCode"], r["typeCode"]))
 
 
 def is_private(scheme):
@@ -226,8 +430,12 @@ def is_private(scheme):
     return scheme.startswith("99")
 
 
-def coverage(codes, reference):
-    """One row per distinct batch code: is it a code DICOM uses, and with this meaning?"""
+def coverage(codes, reference, cids=None):
+    """One row per distinct batch code: is it a code DICOM uses, and with this meaning?
+
+    `cids` is dcm_cids' table, if the caller has it; it fills the `cids`
+    column with the context groups the code appears in.
+    """
     rows = []
     for (scheme, value), info in codes.items():
         meanings = sorted(m for m in info["meanings"] if m)
@@ -235,6 +443,7 @@ def coverage(codes, reference):
         row = {
             "CodingSchemeDesignator": scheme,
             "CodeValue": value,
+            "codeSequences": "; ".join(sorted(info.get("sequences", ()))),
             "meaningsInBatch": " | ".join(meanings),
             "distinctMeanings": len(meanings),
             "segments": info["segments"],
@@ -244,6 +453,7 @@ def coverage(codes, reference):
             "dcmMeanings": "",
             "meaningAgrees": "",
             "numCids": "",
+            "cids": "",
         }
         if entry is not None:
             agreeing = sum(1 for m in meanings if normalise(m) in entry["normalised"])
@@ -253,6 +463,9 @@ def coverage(codes, reference):
                 "True" if agreeing == len(meanings) and meanings
                 else "False" if agreeing == 0
                 else "PARTIAL")
+            if cids:
+                row["cids"] = "; ".join(
+                    str(n) for n in sorted({c[0] for c in cids.get((scheme, value), ())}))
         rows.append(row)
     return sorted(rows, key=lambda r: (-r["segments"], r["CodeValue"]))
 
@@ -349,14 +562,13 @@ def command_fetch(args, cache):
 def command_coverage(args, cache):
     fetch(cache, quiet=True)
     report_provenance(cache)
-    prefix = args.column.replace("CodeValue", "")
-    codes = batch_codes(args.table, args.column,
-                        f"{prefix}CodingSchemeDesignator",
-                        f"{prefix}CodeMeaning")
+    columns = args.column or DEFAULT_COLUMNS
+    codes = batch_codes(args.table, columns)
     if not codes:
-        sys.exit(f"no values in {args.column}")
+        sys.exit(f"no values in {', '.join(columns)}")
+    print(f"  {len(codes)} distinct codes across {', '.join(columns)}", file=sys.stderr)
 
-    rows = coverage(codes, dcm_codes(cache))
+    rows = coverage(codes, dcm_codes(cache), dcm_cids(cache))
     write(args.output, rows, COVERAGE_COLUMNS)
 
     covered = [r for r in rows if r["inDcmterm"] == "True"]
@@ -397,6 +609,56 @@ def command_coverage(args, cache):
                   f"DICOM: {row['dcmMeanings'][:34]}", file=sys.stderr)
         if len(disagree) > 15:
             print(f"    ... and {len(disagree) - 15} more", file=sys.stderr)
+    return 0
+
+
+def command_property(args, cache):
+    fetch(cache, quiet=True)
+    report_provenance(cache)
+    groups = dcm_context_groups(cache)
+    direct, links = codes_by_cid(cache)
+    pairs = property_pairs(args.table)
+    if not pairs:
+        sys.exit("no SegmentedPropertyCategory or SegmentedPropertyType codes in the table")
+
+    rows = property_check(pairs, groups, direct, links)
+    write(args.output, rows, PROPERTY_COLUMNS)
+
+    segments = sum(r["segments"] for r in rows)
+    kinds = defaultdict(int)
+    for row in rows:
+        for issue in row["propertyIssue"].split("; "):
+            if issue:
+                kinds[issue] += row["segments"]
+    categories = {(r["categoryScheme"], r["categoryCode"]) for r in rows if r["categoryCode"]}
+    types = {(r["typeScheme"], r["typeCode"]) for r in rows if r["typeCode"]}
+    print(f"\n  {len(pairs)} distinct (category, type) pairings over {segments} "
+          f"segments: {len(categories)} categories, {len(types)} types",
+          file=sys.stderr)
+    if not kinds:
+        print("  ok: every category is in CID 7150, every type in CID 7151, and "
+              "every type\n  in the context group its category names", file=sys.stderr)
+    for issue, label in (
+        ("TYPE_OUTSIDE_CATEGORY",
+         "type is a property type, but not of this CATEGORY (Medium)"),
+        ("TYPE_NOT_IN_CID", "type not in CID 7151 - baseline, so permitted (Low)"),
+        ("CATEGORY_NOT_IN_CID", "category not in CID 7150 - baseline (Low)"),
+    ):
+        if kinds[issue]:
+            print(f"  {kinds[issue]:>6} segments  {issue:<22} {label}", file=sys.stderr)
+    shown = 0
+    for row in rows:
+        if row["propertyIssue"] and shown < 12:
+            print(f"    {row['segments']:>5}  {row['categoryCode']:<11} "
+                  f"{row['categoryMeaning'][:24]:<24} / {row['typeCode']:<11} "
+                  f"{row['typeMeaning'][:24]:<24} {row['propertyIssue']}",
+                  file=sys.stderr)
+            shown += 1
+    print("\n  PS3.3 Table C.8.20-4: BCID 7150 for (0062,0003), BCID 7151 for "
+          "(0062,000F). Baseline, so membership\n  is not conformance - but a type "
+          "outside the CID its own category names contradicts the category.\n  Fold "
+          "into the triage list with: seg_checks.py --property " + str(args.output),
+          file=sys.stderr)
     return 0
 
 
@@ -471,10 +733,21 @@ def main():
     coverage_parser.add_argument("table", help="CSV from seg_attributes.py")
     coverage_parser.add_argument("-o", "--output", default="coverage.csv")
     coverage_parser.add_argument(
-        "--column", default="AnatomicRegionCodeValue",
-        help="which code column to check (default: %(default)s). Use "
-             "SegmentedPropertyTypeCodeValue for the type coding.")
+        "--column", action="append", metavar="CODEVALUE_COLUMN",
+        help="which CodeValue column to check; repeatable. Default: the anatomic "
+             "region, the segmented property type AND the segmented property "
+             "category, since the anatomy is often the type code with no region "
+             "at all. Name one column to narrow it.")
     coverage_parser.set_defaults(run=command_coverage)
+
+    property_parser = sub.add_parser(
+        "property",
+        help="issue 15: category and type codes against CID 7150 / 7151, and "
+             "each type against the context group its category names")
+    property_parser.add_argument("table", help="CSV from seg_attributes.py")
+    property_parser.add_argument("-o", "--output",
+                                 default="issue15_property_context_group.csv")
+    property_parser.set_defaults(run=command_property)
 
     lookup_parser = sub.add_parser(
         "lookup", help="what DICOM records for a code, and in which context groups")

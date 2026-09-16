@@ -1,5 +1,72 @@
 # Changelog
 
+## 1.4.0 — 2026-09-16
+
+The terminology checks now read the sequences that actually carry the anatomy,
+three checks are added, and the review table has a contract.
+
+- **Issues 1, 2, 3 and 8 judge three code sequences**, not `AnatomicRegionSequence`
+  alone: the anatomic region (Type 3), the segmented property type (Type 1) and the
+  segmented property category (Type 1). A producer that puts the organ in the type
+  sequence and omits the region is conformant and common - most organ
+  segmentations converted with dcmqi or highdicom look like that - and every
+  earlier version of this skill reported such a batch clean. Ambiguity is judged
+  per `(codeSequence, CodeValue)`; findings carry a `codeSequence` column; a segment
+  offending in two sequences is one segment to recode. `lookup_codes.py` and
+  `dcmterm.py coverage` resolve all three by default and record `codeSequences` per
+  code; `seg_checks.py --sequences` and `--column` narrow them. `sql/02`, `03`, `05`,
+  `06`, `07` and `12` open with the same `codes` CTE. Step 1 of the workflow now
+  says which sequence carries the anatomy, and both the extractor and
+  `seg_checks.py` print it.
+- **Issue 15 - category and type against their context groups.**
+  `dcmterm.py property` decides, per distinct `(category, type)` pairing, whether
+  the category is in CID 7150, whether the type is in CID 7151, and whether the
+  type is in the CID that its own category names in CID 7150's "Segmentation
+  Property Type Context Group" column. The first two are Baseline (PS3.3 Table
+  C.8.20-4), so Low; the third contradicts the category - "Anatomical Structure"
+  over a lesion type - and is Medium. CID 7151 is nothing but Include-CID lines,
+  so membership is the transitive closure over dcmterms' `context_groups.parquet`,
+  which the script now downloads too. `seg_checks.py --property` folds it in.
+  Script only; the BigQuery path exports the view and runs it.
+- **Issue 16 - Segment Numbers.** PS3.3 C.8.20.2.4: unique within the instance,
+  and 1..n by 1 on BINARY and FRACTIONAL objects. Medium. Runs on the unfiltered
+  rows, since a 0 on a BINARY object is the defect and a LABELMAP's 0 is not.
+  `sql/16_segment_numbers.sql`.
+- **Issue 17 - Frame of Reference.** PS3.3 A.51.1: "If the referenced images have
+  a defined Frame of Reference, the Segmentation Instance shall have the same
+  Frame of Reference." Medium, with `REFERENCED_SERIES_MISSING` for a dangling
+  reference. Needs the referenced series resolved: always on BigQuery through
+  `@@IMAGE_TABLE@@`, with `--resolve-referenced` on the file and DICOMweb paths -
+  which is now implemented for DICOMweb, where 1.3.0 documented it but did not
+  do it. Silent where unresolved, and the report must say so.
+  `sql/17_frame_of_reference.sql`.
+- **The review table has a documented header**, in `references/terminology.md` and
+  `templates/review.csv`, with an optional `codeSequence` column. `seg_checks.py`
+  refuses a table missing a required column and names the expected header, and
+  reports how many review rows matched no segment. Before this a wrong header
+  joined nothing and reported nothing.
+- **The per-segment table is the same 61 columns on all three paths.** It was not:
+  the SQL view lacked `Collection`, the script lacked `referencedInstanceCount` and
+  `referencedSeriesCount`, and the two spelled `SoftwareVersions` differently.
+  Added `referencedFrameOfReferenceUID` and `referencedSeriesFound`.
+- **CSV booleans are read case-insensitively.** A BigQuery export writes `true`,
+  the extractor `True`; `seg_checks.py` compared against the latter, so on an
+  exported CSV Background segments were never excluded.
+- **`dciodvfy_check.py` fails loudly on a build without `-allpffgitems`.** A
+  dicom3tools build predating the flag prints "unrecognized option" and validates
+  nothing, and the runner then reported every object clean. It now stops, names
+  the binary, and prefers the `dciodvfy` installed beside the running interpreter
+  over one found earlier on `PATH`.
+- `scripts/make_fixture.py` writes a five-file synthetic delivery with known
+  defects, for checking an installation end to end. `requirements.txt` lists
+  every optional dependency. `cielab.py --help` no longer raises.
+- SKILL.md is rewritten at about two thirds the length: the description no longer
+  enumerates every check, the workflow carries its own commands, and the per-issue
+  traps live only in the catalogue. Issue 3's citation of the modifier context
+  group now reads "Defined CID 2" in the catalogue as it did in terminology.md.
+- 42 more tests, 151 in all. The counts in the 1.2.0 and 1.3.0 entries below are
+  corrected to what the suite actually gained.
+
 ## 1.3.0 — 2026-09-16
 
 Four checks about how a delivery is *encoded* and *presented*, rather than coded.
@@ -65,7 +132,7 @@ Four checks about how a delivery is *encoded* and *presented*, rather than coded
   join issue 9 as objects-only, and every reference now says which of the six tags a
   given path cannot produce — silence in a triage CSV looks the same whether a check
   passed or never ran.
-- 31 more tests, including the mid-byte frame boundary, the encapsulated opposite, the
+- 41 more tests, including the mid-byte frame boundary, the encapsulated opposite, the
   sRGB round trip against independently computed values, and same-structure colour
   sharing *not* being a finding. The suite still needs no network, no dicom3tools and
   no fixture files.
@@ -112,7 +179,7 @@ The review now validates the objects, not only their metadata table.
   that silence is "not checked", not "conformant".
 - Report provenance extends to the validator build alongside the two terminology
   sources.
-- 24 more tests, including the `dciodvfy -new` grammar pinned against captured real
+- 25 more tests, including the `dciodvfy -new` grammar pinned against captured real
   output — so a dicom3tools build that changes the message format fails the suite
   rather than silently parsing to nothing. The suite still needs neither network nor
   dicom3tools.

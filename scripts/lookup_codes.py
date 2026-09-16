@@ -41,10 +41,22 @@ COLUMNS = [
     "found",
     "active",
     "isEntireFlavour",
+    "codeSequences",
     "meaningsInBatch",
     "distinctMeanings",
     "segments",
     "series",
+]
+
+# The code sequences resolved by default. The anatomic region is Type 3 in the
+# Segment Description Macro and the other two are Type 1, so on many
+# deliveries the organ is the TYPE code and the region is absent; resolving
+# the region alone would then resolve nothing. A code used in more than one
+# sequence is looked up once and its `codeSequences` column says where.
+DEFAULT_COLUMNS = [
+    "AnatomicRegionCodeValue",
+    "SegmentedPropertyTypeCodeValue",
+    "SegmentedPropertyCategoryCodeValue",
 ]
 
 
@@ -86,19 +98,36 @@ def lookup(code, system=SNOMED_SYSTEM, timeout=15):
     return True, display, active
 
 
-def collect(table, value_column, scheme_column, meaning_column):
+def collect(table, columns):
+    """Distinct (scheme, code) across the CodeValue `columns`, with what
+    depends on each.
+
+    `columns` is one column name or a list; the scheme and meaning columns
+    follow from the prefix. A code used in two sequences is one entry whose
+    `sequences` names both, and its `segments` count is one per sequence that
+    carries it. Background segments are excluded - they are an artefact of
+    labelmap encoding, not something segmented.
+    """
+    if isinstance(columns, str):
+        columns = [columns]
     codes = defaultdict(
-        lambda: {"meanings": set(), "segments": 0, "series": set()}
+        lambda: {"meanings": set(), "segments": 0, "series": set(), "sequences": set()}
     )
     with open(table, newline="") as handle:
         for row in csv.DictReader(handle):
-            value = (row.get(value_column) or "").strip()
-            if not value or row.get("isBackgroundSegment") == "True":
+            if (row.get("isBackgroundSegment") or "").strip().lower() == "true":
                 continue
-            entry = codes[((row.get(scheme_column) or "").strip(), value)]
-            entry["meanings"].add((row.get(meaning_column) or "").strip())
-            entry["segments"] += 1
-            entry["series"].add(row.get("SeriesInstanceUID", ""))
+            for column in columns:
+                prefix = column.replace("CodeValue", "")
+                value = (row.get(column) or "").strip()
+                if not value:
+                    continue
+                scheme = (row.get(f"{prefix}CodingSchemeDesignator") or "").strip()
+                entry = codes[(scheme, value)]
+                entry["meanings"].add((row.get(f"{prefix}CodeMeaning") or "").strip())
+                entry["segments"] += 1
+                entry["series"].add(row.get("SeriesInstanceUID", ""))
+                entry["sequences"].add(prefix)
     return codes
 
 
@@ -112,26 +141,25 @@ def main():
     parser.add_argument("-o", "--output", default="codes.csv")
     parser.add_argument(
         "--column",
-        default="AnatomicRegionCodeValue",
-        help="which code column to resolve (default: %(default)s). Use "
-        "SegmentedPropertyTypeCodeValue to review the type coding instead.",
+        action="append",
+        metavar="CODEVALUE_COLUMN",
+        help="which CodeValue column to resolve; repeatable. Default: the "
+        "anatomic region, the segmented property type AND the segmented "
+        "property category - the anatomy is often the TYPE code, with no "
+        "region at all. Name one column to narrow it.",
     )
     parser.add_argument("--delay", type=float, default=0.3,
                         help="seconds between requests; do not hammer a public server")
     args = parser.parse_args()
 
-    prefix = args.column.replace("CodeValue", "")
-    codes = collect(
-        args.table,
-        args.column,
-        f"{prefix}CodingSchemeDesignator",
-        f"{prefix}CodeMeaning",
-    )
+    columns = args.column or DEFAULT_COLUMNS
+    codes = collect(args.table, columns)
     if not codes:
-        sys.exit(f"no values in {args.column}")
+        sys.exit(f"no values in {', '.join(columns)}")
 
     ordered = sorted(codes.items(), key=lambda kv: (-kv[1]["segments"], kv[0][1]))
-    print(f"{len(ordered)} distinct codes in {args.column}\n", file=sys.stderr)
+    print(f"{len(ordered)} distinct codes across {', '.join(columns)}\n",
+          file=sys.stderr)
     print(f"{'code':<14} {'st':>4}  {'segs':>5}  fully specified name", file=sys.stderr)
     print("-" * 78, file=sys.stderr)
 
@@ -145,6 +173,7 @@ def main():
             "found": "",
             "active": "",
             "isEntireFlavour": "False",
+            "codeSequences": "; ".join(sorted(info["sequences"])),
             "meaningsInBatch": " | ".join(meanings),
             "distinctMeanings": len(meanings),
             "segments": info["segments"],

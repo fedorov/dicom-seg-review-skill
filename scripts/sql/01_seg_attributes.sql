@@ -101,7 +101,8 @@ WITH
     SELECT
       SeriesInstanceUID,
       ANY_VALUE(Modality) AS Modality,
-      ANY_VALUE(BodyPartExamined) AS BodyPartExamined
+      ANY_VALUE(BodyPartExamined) AS BodyPartExamined,
+      ANY_VALUE(FrameOfReferenceUID) AS FrameOfReferenceUID
     FROM
       `@@IMAGE_TABLE@@`
     WHERE
@@ -112,6 +113,12 @@ WITH
   )
 
 SELECT
+  # description:
+  # Collection or project the segmentation belongs to. NULL on a plain
+  # Healthcare API export, which carries no such attribute; on IDC, add
+  # collection_id to the segInstances CTE and select it here.
+  CAST(NULL AS STRING) AS Collection,
+
   # description:
   # DICOM PatientID
   segInstances.PatientID,
@@ -380,8 +387,8 @@ SELECT
   segInstances.ManufacturerModelName,
 
   # description:
-  # First value of DICOM SoftwareVersions of the producing software
-  segInstances.SoftwareVersions[SAFE_OFFSET(0)] AS SoftwareVersion,
+  # First value of DICOM SoftwareVersions (0018,1020) of the producing software
+  segInstances.SoftwareVersions[SAFE_OFFSET(0)] AS SoftwareVersions,
 
   # description:
   # Number of segments in the segmentation object this segment belongs to
@@ -413,6 +420,21 @@ SELECT
     imageSeries.BodyPartExamined,
     segInstances.referencedSeries.BodyPartExamined)
     AS referencedBodyPartExamined,
+
+  # description:
+  # FrameOfReferenceUID of the referenced image series, from @@IMAGE_TABLE@@.
+  # PS3.3 A.51.1: the segmentation "shall have the same Frame of Reference" as
+  # referenced images that define one - see 17_frame_of_reference.sql. NULL
+  # when the series is not in @@IMAGE_TABLE@@.
+  imageSeries.FrameOfReferenceUID AS referencedFrameOfReferenceUID,
+
+  # description:
+  # TRUE when the referenced series exists in @@IMAGE_TABLE@@, FALSE when the
+  # reference dangles, NULL when nothing is referenced. Always decided on this
+  # path; the file and DICOMweb extractors need --resolve-referenced.
+  IF(segInstances.referencedSeries.SeriesInstanceUID IS NULL,
+     NULL,
+     imageSeries.SeriesInstanceUID IS NOT NULL) AS referencedSeriesFound,
 
   # description:
   # Number of instances of the referenced series listed in

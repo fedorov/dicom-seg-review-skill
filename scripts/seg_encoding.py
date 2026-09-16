@@ -53,7 +53,7 @@ DEFLATED_DATASET = "1.2.840.10008.1.2.1.99"
 # (Bits Allocated == 1) Segmentation as its motivating application, so it is
 # the compression the Standard designed for the objects this skill reviews.
 #
-# pydicom 3.0.1 does not know this UID at all - `UID.is_encapsulated` raises
+# pydicom 3.0.x (checked through 3.0.2) does not know this UID - `UID.is_encapsulated` raises
 # "UID is not a transfer syntax" and dcmwrite refuses it - though dcmread
 # still parses such a file, falling back to Explicit VR Little Endian. That is
 # why the fragments are split and inflated here: it costs ~20 lines and means

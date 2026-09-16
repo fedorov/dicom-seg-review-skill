@@ -1,0 +1,6 @@
+# Everything the scripts can use. seg_checks.py, lookup_codes.py and cielab.py
+# need none of it; see README.md "Dependencies" for which script needs what.
+pydicom>=3.0            # seg_attributes.py --files, seg_encoding.py, dciodvfy_check.py, make_fixture.py, tests
+pyarrow                 # dcmterm.py (any one of pyarrow, duckdb or pandas reads the Parquet)
+dicom3tools             # dciodvfy, for dciodvfy_check.py
+dicomweb-client>=0.59   # seg_attributes.py --dicomweb; add [gcp] and google-auth for Healthcare API stores

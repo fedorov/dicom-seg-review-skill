@@ -214,8 +214,9 @@ def describe(triplet):
 
 
 def main():
-    if len(sys.argv) < 2:
-        sys.exit(__doc__.strip())
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
+        print(__doc__.strip())
+        return 0 if len(sys.argv) >= 2 else 1
     for argument in sys.argv[1:]:
         triplet = parse(argument)
         if triplet is None:

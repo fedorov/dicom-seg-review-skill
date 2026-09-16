@@ -109,10 +109,14 @@ https://viewer.imaging.datacommons.cancer.gov/viewer/{StudyInstanceUID}?SeriesIn
 
 - **Collection / project membership**, unless the store carries `ClinicalTrial*`
   attributes. The BigQuery path usually gets it from a separate mapping table.
-- **The referenced image series' `Modality` and `BodyPartExamined`**, unless the
-  producer copied them into `ReferencedSeriesSequence` — many do not. If the referenced
-  series is in the same store, the script can fetch its metadata too (`--resolve-referenced`),
-  at one extra request per distinct referenced series.
+- **The referenced image series' `Modality`, `BodyPartExamined` and
+  `FrameOfReferenceUID`**, unless the producer copied the first two into
+  `ReferencedSeriesSequence` — many do not. `--resolve-referenced` fetches one
+  instance's metadata per distinct referenced series from the same store: one QIDO
+  instance search filtered on `SeriesInstanceUID`, one metadata request. Without it
+  issue 17 (Frame of Reference) is silent, and a referenced series the store does
+  not hold goes unnoticed. A search that *fails* is recorded as found-but-unknown,
+  so a flaky connection cannot manufacture a dangling reference.
 - **The "attribute absent from the schema" signal.** A BigQuery export tells you
   positively that *no* instance in the batch populates an attribute. Over DICOMweb you
   learn the same thing only by extracting everything and finding the column empty —
@@ -152,8 +156,10 @@ The same retrieval decides issues 11 and 12, for two further reasons:
 Both are cheap once the sample is on disk — one pass, no codec — so a sample retrieved
 for `dciodvfy` should be run through `seg_encoding.py` at the same time.
 
-Issues 13 and 14 **do** run here: `RecommendedDisplayCIELabValue`,
-`SegmentAlgorithmName` and `SegmentationAlgorithmIdentificationSequence` are all in
-the metadata response, and `seg_attributes.py` extracts them. If the extractor's
-coverage summary lists them as populated by no instance, that absence is the finding.
+Issues 13, 14, 15 and 16 **do** run here: `RecommendedDisplayCIELabValue`,
+`SegmentAlgorithmName`, `SegmentationAlgorithmIdentificationSequence`, the category
+and type codes and the segment numbers are all in the metadata response, and
+`seg_attributes.py` extracts them. If the extractor's coverage summary lists an
+attribute as populated by no instance, that absence is the finding. Issue 17 runs
+with `--resolve-referenced`.
 

@@ -1,10 +1,21 @@
 # Issue catalogue
 
-The fourteen checks. Each gives what the defect is, why it matters, how to detect
+The seventeen checks. Each gives what the defect is, why it matters, how to detect
 it, and what the finding looks like in practice.
 
 Numbering is stable. Add new issues with the next free number; do not renumber, since
 reports cite these.
+
+**Which code sequences the terminology checks read.** Issues 1, 2, 3 and 8, the
+coverage gap and the FSN lookup all judge three sequences of the Segment
+Description Macro (PS3.3 Table C.8.20-4): `AnatomicRegionSequence` (0008,2218),
+Type 3; `SegmentedPropertyTypeCodeSequence` (0062,000F), Type 1; and
+`SegmentedPropertyCategoryCodeSequence` (0062,0003), Type 1. A producer that puts
+the organ in the type sequence and omits the region is conformant, and most
+organ-segmentation deliveries converted with dcmqi or highdicom look like that. A
+review that read the region alone reported such a batch clean. Findings carry a
+`codeSequence` column saying which one the code was in, and a segment offending in
+two sequences is one segment to recode, not two.
 
 ---
 
@@ -68,8 +79,11 @@ Consequence: **neither field works as a grouping key.** Grouping on `CodeValue` 
 segments labelled as different anatomy; grouping on `CodeMeaning` splits segments that
 share a code.
 
-**Detection.** Group by `CodeValue`, keep those with more than one distinct
-`CodeMeaning`. Then classify each segment by `scope` — this is the column that matters:
+**Detection.** Group by `(codeSequence, CodeValue)`, keep those with more than one
+distinct `CodeMeaning`. Ambiguity is judged per role: a code used as the region on
+one segment and as the type on another is compared only with other uses in the
+same sequence. Then classify each segment by `scope` — this is the column that
+matters:
 
 | `scope` | Means |
 |---|---|
@@ -109,7 +123,7 @@ the best argument for doing step 4 of the workflow by hand.
 
 Both failure modes come from one choice: expressing laterality by **pre-coordination**,
 picking a code that already names the side. DICOM's post-coordinated alternative is
-**`AnatomicRegionModifierSequence` (0008,2220)**, baseline CID 2, laterality from
+**`AnatomicRegionModifierSequence` (0008,2220)**, Defined CID 2, laterality from
 **CID 244** — `7771000` Left, `24028007` Right, `66459002` Unilateral, `51440002`
 Bilateral. Where a batch pre-coordinates, this attribute is typically absent from the
 export schema entirely, which is itself the finding.
@@ -555,9 +569,10 @@ compress" is not. Quote it as the optimistic end of the range: compressing the
 whole stream at once beats compressing frames separately.
 
 **The cost of recommending `1.2.840.10008.1.2.8.1` is real, so state it.**
-pydicom 3.0.1 does not know the UID at all — `UID.is_encapsulated` raises "UID is
-not a transfer syntax" and `dcmwrite` refuses it — though `dcmread` still parses
-such a file by falling back to Explicit VR Little Endian. Check what the
+pydicom 3.0.x (checked through 3.0.2) does not know the UID at all —
+`UID.is_encapsulated` raises "UID is not a transfer syntax" and `dcmwrite` refuses
+it — though `dcmread` still parses such a file by falling back to Explicit VR
+Little Endian. Check what the
 consumers of this delivery can actually read before telling a producer to switch;
 `1.2.840.10008.1.2.1.99` is older and more widely supported, and for a
 segmentation its pixel data compresses nearly as well.
@@ -698,3 +713,96 @@ disagreement is informative. A batch whose `ManufacturerModelName` is an
 inference toolkit while every `SegmentAlgorithmType` says `MANUAL` is
 misdescribing how it was made, and that belongs in the report even though no
 query returns it.
+
+---
+
+## 15. Category or type code outside its context group
+
+**Severity: Medium** where the type contradicts its own category, **Low** where a
+code is merely outside the baseline group. **Layer: computed**, from dcmterms'
+context-group tables; runs on every access path.
+
+PS3.3 Table C.8.20-4 gives `SegmentedPropertyCategoryCodeSequence` (0062,0003)
+**BCID 7150** "Segmentation Property Category" and
+`SegmentedPropertyTypeCodeSequence` (0062,000F) **BCID 7151** "Segmentation
+Property Type". Both are **Baseline**, so a code outside them is permitted, and
+membership alone is Low. CID 7150 does one more thing: its "Segmentation Property
+Type Context Group" column names, per category, the CID its types come from —
+`91723000` "Anatomical Structure" → CID 7192, `49755003` "Morphologically Abnormal
+Structure" → CID 7194, and so on. A type that is a segmentation property type but
+not one of the CID its own category names contradicts the category: "Anatomical
+Structure" over a lesion type says the segment is an organ and a neoplasm at once.
+A consumer filtering on category then gets the wrong answer, so that one is Medium.
+
+| `propertyIssue` | Severity | Meaning |
+|---|---|---|
+| `TYPE_OUTSIDE_CATEGORY` | Medium | The type is in CID 7151 but not in the CID its category names |
+| `TYPE_NOT_IN_CID` | Low | The type is in no segmentation property type context group |
+| `CATEGORY_NOT_IN_CID` | Low | The category is not one of CID 7150's nine |
+
+**Detection.** `scripts/dcmterm.py property seg_attributes.csv`, then
+`seg_checks.py --property`. CID 7151 is nothing but Include-CID lines — nine of
+them, each including more (CID 7192 alone includes 25) — so membership is the
+transitive closure over dcmterms' `context_groups.parquet`, and the category → type
+link comes from `coded_entries.parquet`. Private (`99…`) schemes are not judged;
+retired ones are issue 10's and are noted rather than tagged. There is no SQL form:
+export the per-segment view and run the script.
+
+**Report the pairings, not the segments.** One row per distinct `(category, type)`
+is what the producer fixes, and the CSV is shaped that way; the triage list carries
+the tags per series.
+
+---
+
+## 16. Segment Numbers not unique, or not 1..n
+
+**Severity: Medium.** **Layer: computed.**
+
+PS3.3 C.8.20.2.4: "Segment Number (0062,0004) shall be unique within each
+Instance", and where Segmentation Type is BINARY or FRACTIONAL it "shall start at a
+Value of 1, and increase monotonically by 1". LABELMAP numbers are pixel values and
+need not be consecutive; a LABELMAP's 0 is the Background.
+
+| `segmentNumberProblem` | Meaning |
+|---|---|
+| `DUPLICATE` | A number appears twice in one object. The `(SOPInstanceUID, SegmentNumber)` key every check relies on is broken for that object. |
+| `NOT_SEQUENTIAL` | A BINARY or FRACTIONAL object whose distinct numbers are not exactly 1..n — a gap, or a 0. |
+
+**Detection.** `seg_checks.py` runs it on every invocation, on the **unfiltered**
+rows: this is the one check that must see the Background segment, since a 0 on a
+BINARY object is the defect. `sql/16_segment_numbers.sql` is the BigQuery form. The
+order of items in the Segment Sequence is not recoverable from a table, so
+"increase by 1" is checked as "the numbers are 1..n"; an object numbered 2, 1
+passes here and is dciodvfy's to report.
+
+Detectable by any reader, hence Medium — but a consumer that indexes frames by
+segment number will silently merge two segments on a `DUPLICATE`, so call that one
+out separately.
+
+---
+
+## 17. Frame of Reference differs from the referenced series
+
+**Severity: Medium.** **Layer: computed, where the referenced series is resolved.**
+
+PS3.3 A.51.1 (Segmentation IOD Description): "If the referenced images have a
+defined Frame of Reference, the Segmentation Instance shall have the same Frame of
+Reference." A viewer decides whether to overlay a segmentation on an image by
+comparing exactly these two UIDs. A mismatch is a segmentation nobody can display
+on its source: non-conformant and unusable, but detectable, so Medium.
+
+| `frameOfReferenceProblem` | Meaning |
+|---|---|
+| `FRAME_OF_REFERENCE_MISMATCH` | The referenced series was found and its `FrameOfReferenceUID` differs |
+| `REFERENCED_SERIES_MISSING` | `ReferencedSeriesSequence` names a series the store or directory does not hold — the images were never delivered, or the UID is wrong |
+
+**Detection needs the referenced series.** The per-segment table carries
+`referencedFrameOfReferenceUID` and `referencedSeriesFound`. BigQuery fills them
+from `@@IMAGE_TABLE@@` on every run; the file and DICOMweb extractors fill them
+only with `--resolve-referenced`, which reads one instance of each referenced
+series. Where they are empty the check is **silent**, and the report must say
+"not checked" rather than let the silence read as a match. `seg_checks.py` prints
+which it was; `sql/17_frame_of_reference.sql` is the BigQuery form.
+
+Only the first item of `ReferencedSeriesSequence` is compared;
+`referencedSeriesCount` says when there were more.

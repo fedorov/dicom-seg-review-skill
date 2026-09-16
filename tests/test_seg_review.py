@@ -14,6 +14,7 @@ neither network nor dicom3tools; the captures are real dciodvfy -new output,
 copied verbatim.
 """
 
+import csv
 import sys
 import unittest
 from collections import Counter, defaultdict
@@ -26,6 +27,7 @@ from pydicom.dataset import Dataset  # noqa: E402
 import cielab  # noqa: E402
 import dciodvfy_check  # noqa: E402
 import dcmterm  # noqa: E402
+import lookup_codes  # noqa: E402
 import seg_attributes  # noqa: E402
 import seg_checks  # noqa: E402
 import seg_encoding  # noqa: E402
@@ -156,7 +158,7 @@ class TestAmbiguousCodes(unittest.TestCase):
                      sop="1.2", series="S2"),
         ])
         findings, ambiguous, _ = seg_checks.ambiguous_codes(rows)
-        self.assertIn("91394001", ambiguous)
+        self.assertIn(("AnatomicRegion", "91394001"), ambiguous)
         scopes = {(f["SeriesInstanceUID"], f["SegmentLabel"]): f["scope"]
                   for f in findings}
         self.assertEqual(scopes[("S1", "A")], "SELF_INCONSISTENT")
@@ -179,7 +181,7 @@ class TestAmbiguousCodes(unittest.TestCase):
         self.assertEqual(scopes["S3"], "MINORITY_MEANING")
         self.assertEqual(scopes["S1"], "DOMINANT_MEANING")
         # Near-identical meanings: the same anatomy written two ways.
-        self.assertIn("12003004", cosmetic)
+        self.assertIn(("AnatomicRegion", "12003004"), cosmetic)
 
     def test_unambiguous_code_is_not_reported(self):
         rows = rows_for([instance([segment(1, "A", region=("10200004", "Liver")),
@@ -908,7 +910,7 @@ class TestAlgorithmIdentification(unittest.TestCase):
             "hasAlgorithmIdentification": "True",
             "AlgorithmName": "nnU-Net", "AlgorithmVersion": "2.4.1",
             "AlgorithmSource": "Acme", "AlgorithmNameCodeMeaning": "",
-            "ManufacturerModelName": "dcmqi", "SoftwareVersion": "1.3.4",
+            "ManufacturerModelName": "dcmqi", "SoftwareVersions": "1.3.4",
             "SeriesDescription": "SEG", "viewer_url": "",
         }
         row.update(overrides)
@@ -1129,6 +1131,385 @@ class TestEncodingTags(unittest.TestCase):
                     "EMPTY_SEGMENT"):
             self.assertNotIn(tag, out[0]["issues"])
 
+
+def type_coded(label, code, meaning, series="S1", sop="1.1",
+               category=("91723000", "Anatomical Structure")):
+    """A segment whose anatomy is the TYPE code and which has no
+    AnatomicRegionSequence at all - the common, conformant shape."""
+    seg = segment(1, label, region=None, category=None, seg_type=None)
+    seg.SegmentedPropertyCategoryCodeSequence = [code_item(*category)]
+    seg.SegmentedPropertyTypeCodeSequence = [code_item(code, meaning)]
+    return instance([seg], series=series, sop=sop)
+
+
+code_item = code  # the module-level helper, under a name segment() cannot shadow
+
+
+class TestCodeSequences(unittest.TestCase):
+    """The terminology checks judge the type and category sequences too. The
+    anatomic region is Type 3, and on many deliveries the anatomy is the TYPE
+    code with no region at all - a region-only review reports those clean."""
+
+    def rows(self):
+        return rows_for([
+            type_coded("Liver", "10200004", "Liver", series="S1", sop="1.1"),
+            type_coded("Bowel", "10200004", "Large bowel", series="S2", sop="1.2"),
+        ])
+
+    def test_ambiguity_is_found_in_the_type_sequence(self):
+        findings, ambiguous, _ = seg_checks.ambiguous_codes(self.rows())
+        self.assertIn(("SegmentedPropertyType", "10200004"), ambiguous)
+        self.assertEqual({f["codeSequence"] for f in findings}, {"SegmentedPropertyType"})
+        self.assertEqual({f["CodeValue"] for f in findings}, {"10200004"})
+
+    def test_a_region_only_review_would_miss_it(self):
+        _, ambiguous, _ = seg_checks.ambiguous_codes(self.rows(), ["AnatomicRegion"])
+        self.assertEqual(ambiguous, {})
+
+    def test_a_code_is_judged_per_role(self):
+        """The same code as the region with one meaning and as the type with
+        another is two roles, not one ambiguous code."""
+        rows = rows_for([instance([segment(1, "A", region=("10200004", "Liver"),
+                                           seg_type="10200004")])])
+        rows[0]["SegmentedPropertyTypeCodeMeaning"] = "Liver structure"
+        _, ambiguous, _ = seg_checks.ambiguous_codes(rows)
+        self.assertEqual(ambiguous, {})
+
+    def test_the_type_sequence_reaches_the_triage_list(self):
+        rows = self.rows()
+        _, ambiguous, cosmetic = seg_checks.ambiguous_codes(rows)
+        out = {r["SeriesInstanceUID"]: r
+               for r in seg_checks.triage(rows, ambiguous, cosmetic, {}, {}, [])}
+        self.assertIn("CODE_AMBIGUOUS_ELSEWHERE", out["S1"]["issues"])
+        # "Large bowel" sorts before "Liver", so it is the tie-broken dominant
+        # meaning and S1 carries the minority reading.
+        self.assertIn("CODE_MEANING_MINORITY", out["S1"]["issues"])
+
+    def test_curated_verdict_applies_to_the_type_sequence(self):
+        rows = rows_for([type_coded("Bowel", "10200004", "Large bowel")])
+        verdicts = {("10200004", "SCT", "Large bowel"): "WRONG_ANATOMY"}
+        out = seg_checks.triage(rows, {}, set(), {}, verdicts, [])
+        self.assertEqual(out[0]["worstSeverity"], "High")
+        self.assertEqual(out[0]["segmentsNeedingRecode"], 1)
+
+    def test_a_segment_offending_in_two_sequences_is_one_job(self):
+        rows = rows_for([instance([segment(1, "A", region=("10200004", "Large bowel"),
+                                           seg_type="10200004")])])
+        rows[0]["SegmentedPropertyTypeCodeMeaning"] = "Large bowel"
+        verdicts = {("10200004", "SCT", "Large bowel"): "WRONG_ANATOMY"}
+        out = seg_checks.triage(rows, {}, set(), {}, verdicts, [])
+        self.assertEqual(out[0]["segmentsNeedingRecode"], 1)
+
+    def test_entire_flavour_is_found_in_the_type_sequence(self):
+        rows = rows_for([type_coded("Colon", "302508007", "Colon")])
+        path = Path(__file__).resolve().parent / "_codes.csv"
+        path.write_text("CodingSchemeDesignator,CodeValue,fsn,isEntireFlavour\n"
+                        "SCT,302508007,Entire colon (body structure),True\n")
+        self.addCleanup(path.unlink)
+        findings, entire = seg_checks.entire_flavour(rows, path)
+        self.assertEqual(findings[0]["codeSequence"], "SegmentedPropertyType")
+        out = seg_checks.triage(rows, {}, set(), entire, {}, [])
+        self.assertIn("ENTIRE_CODE_FLAVOUR", out[0]["issues"])
+
+    def test_summary_says_which_sequence_carries_the_anatomy(self):
+        summary = {s["codeSequence"]: s
+                   for s in seg_checks.code_sequence_summary(self.rows())}
+        self.assertEqual(summary["AnatomicRegion"]["segmentsWithCode"], 0)
+        self.assertEqual(summary["SegmentedPropertyType"]["segmentsWithCode"], 2)
+        self.assertEqual(summary["SegmentedPropertyType"]["distinctMeanings"], 2)
+
+
+class TestReviewTable(unittest.TestCase):
+    """The curated table's header is a contract: a wrong one used to join
+    nothing and report nothing."""
+
+    def write(self, text):
+        path = Path(__file__).resolve().parent / "_review.csv"
+        path.write_text(text)
+        self.addCleanup(path.unlink)
+        return path
+
+    def test_wrong_header_is_refused_naming_the_expected_one(self):
+        path = self.write("code,meaning,verdict\n10200004,Large bowel,WRONG_ANATOMY\n")
+        with self.assertRaises(ValueError) as caught:
+            seg_checks.load_review(path)
+        self.assertIn("CodeValue", str(caught.exception))
+        self.assertIn(",".join(seg_checks.REVIEW_COLUMNS), str(caught.exception))
+
+    def test_unknown_verdict_is_refused(self):
+        path = self.write("CodeValue,meaningRecorded,verdict\n10200004,Large bowel,WRONG\n")
+        with self.assertRaises(ValueError):
+            seg_checks.load_review(path)
+
+    def test_verdict_without_a_sequence_applies_to_any(self):
+        path = self.write(
+            "CodeValue,CodingSchemeDesignator,codeSequence,meaningRecorded,verdict\n"
+            "10200004,SCT,,Large bowel,WRONG_ANATOMY\n")
+        rows = rows_for([type_coded("Bowel", "10200004", "Large bowel")])
+        one, three = seg_checks.curated(rows, seg_checks.load_review(path))
+        self.assertEqual(len(one), 1)
+        self.assertEqual(one[0]["codeSequence"], "SegmentedPropertyType")
+        self.assertEqual(three, [])
+
+    def test_verdict_scoped_to_a_sequence_does_not_reach_another(self):
+        path = self.write(
+            "CodeValue,CodingSchemeDesignator,codeSequence,meaningRecorded,verdict\n"
+            "10200004,SCT,AnatomicRegion,Large bowel,WRONG_ANATOMY\n")
+        rows = rows_for([type_coded("Bowel", "10200004", "Large bowel")])
+        one, _ = seg_checks.curated(rows, seg_checks.load_review(path))
+        self.assertEqual(one, [])
+
+    def test_the_shipped_template_loads(self):
+        template = Path(__file__).resolve().parent.parent / "templates" / "review.csv"
+        review = seg_checks.load_review(template)
+        self.assertTrue(review)
+        self.assertTrue(all(e["verdict"] in seg_checks.VERDICTS for e in review.values()))
+
+
+class TestSegmentNumbers(unittest.TestCase):
+    """Issue 16. PS3.3 C.8.20.2.4: unique within the instance; 1..n by 1 where
+    the type is BINARY or FRACTIONAL."""
+
+    def rows(self, numbers, segmentation_type):
+        rows = rows_for([instance([segment(n, f"S{n}") for n in numbers])])
+        for row in rows:
+            row["SegmentationType"] = segmentation_type
+        return rows
+
+    def test_binary_numbered_from_one_is_clean(self):
+        self.assertEqual(seg_checks.segment_numbers(self.rows([1, 2], "BINARY")), [])
+
+    def test_a_gap_on_binary_is_not_sequential(self):
+        [finding] = seg_checks.segment_numbers(self.rows([1, 3], "BINARY"))
+        self.assertEqual(finding["segmentNumberProblem"], "NOT_SEQUENTIAL")
+        self.assertEqual(finding["segmentNumbers"], "1/3")
+
+    def test_zero_on_binary_is_the_defect(self):
+        [finding] = seg_checks.segment_numbers(self.rows([0, 1], "BINARY"))
+        self.assertEqual(finding["segmentNumberProblem"], "NOT_SEQUENTIAL")
+
+    def test_labelmap_background_and_gaps_are_permitted(self):
+        self.assertEqual(seg_checks.segment_numbers(self.rows([0, 2, 7], "LABELMAP")), [])
+
+    def test_duplicate_is_reported_whatever_the_type(self):
+        [finding] = seg_checks.segment_numbers(self.rows([1, 1], "LABELMAP"))
+        self.assertEqual(finding["segmentNumberProblem"], "DUPLICATE")
+        self.assertEqual(finding["duplicateNumbers"], "1")
+
+    def test_tags_reach_the_series_as_medium(self):
+        rows = self.rows([1, 3], "FRACTIONAL")
+        numbering = seg_checks.segment_numbers(rows)
+        out = seg_checks.triage(rows, {}, set(), {}, {}, [], numbering=numbering)
+        self.assertIn("SEGMENT_NUMBER_NOT_SEQUENTIAL", out[0]["issues"])
+        self.assertEqual(out[0]["worstSeverity"], "Medium")
+
+
+class TestFrameOfReference(unittest.TestCase):
+    """Issue 17. PS3.3 A.51.1: same Frame of Reference as referenced images
+    that define one. Silence where the reference was never resolved."""
+
+    def rows(self, own, theirs, found, referenced="R1"):
+        rows = rows_for([instance([segment(1, "A")])])
+        rows[0].update({"FrameOfReferenceUID": own,
+                        "referencedSeriesInstanceUID": referenced,
+                        "referencedFrameOfReferenceUID": theirs,
+                        "referencedSeriesFound": found})
+        return rows
+
+    def test_mismatch_is_reported(self):
+        [finding] = seg_checks.frame_of_reference(self.rows("F1", "F2", "True"))
+        self.assertEqual(finding["frameOfReferenceProblem"], "FRAME_OF_REFERENCE_MISMATCH")
+
+    def test_match_is_clean(self):
+        self.assertEqual(seg_checks.frame_of_reference(self.rows("F1", "F1", "True")), [])
+
+    def test_unresolved_reference_is_silence_not_a_pass(self):
+        self.assertEqual(seg_checks.frame_of_reference(self.rows("F1", "", "")), [])
+
+    def test_a_series_not_found_is_the_dangling_reference(self):
+        [finding] = seg_checks.frame_of_reference(self.rows("F1", "", "False"))
+        self.assertEqual(finding["frameOfReferenceProblem"], "REFERENCED_SERIES_MISSING")
+
+    def test_bigquery_lowercase_booleans_are_read(self):
+        [finding] = seg_checks.frame_of_reference(self.rows("F1", "", "false"))
+        self.assertEqual(finding["frameOfReferenceProblem"], "REFERENCED_SERIES_MISSING")
+
+    def test_tags_reach_the_series(self):
+        rows = self.rows("F1", "F2", "True")
+        out = seg_checks.triage(rows, {}, set(), {}, {}, [],
+                                frames=seg_checks.frame_of_reference(rows))
+        self.assertIn("FRAME_OF_REFERENCE_MISMATCH", out[0]["issues"])
+        self.assertEqual(out[0]["worstSeverity"], "Medium")
+
+    def test_extractor_records_found_only_when_a_lookup_was_attempted(self):
+        ds = instance([segment(1, "A")])
+        ds.FrameOfReferenceUID = "F1"
+        ref = Dataset()
+        ref.SeriesInstanceUID = "R1"
+        ds.ReferencedSeriesSequence = [ref]
+        not_attempted = seg_attributes.extract_instance(ds)[0]
+        self.assertEqual(not_attempted["referencedSeriesFound"], "")
+        self.assertEqual(not_attempted["referencedSeriesCount"], "1")
+        absent = seg_attributes.extract_instance(ds, referenced={})[0]
+        self.assertEqual(absent["referencedSeriesFound"], "False")
+        present = seg_attributes.extract_instance(
+            ds, referenced={"R1": {"FrameOfReferenceUID": "F2"}})[0]
+        self.assertEqual(present["referencedSeriesFound"], "True")
+        self.assertEqual(present["referencedFrameOfReferenceUID"], "F2")
+
+
+class TestPropertyContextGroups(unittest.TestCase):
+    """Issue 15, against a stub of dcmterms' three tables: CID 7150 whose
+    Anatomical Structure row points at CID 7192, which includes CID 7154."""
+
+    GROUPS = {
+        7150: {"name": "Segmentation Property Category", "includes": []},
+        7151: {"name": "Segmentation Property Type", "includes": [7192, 7194]},
+        7192: {"name": "Anatomical Structure Segmentation Property Type",
+               "includes": [7154]},
+        7194: {"name": "Morphologically Abnormal Structure Segmentation Property Type",
+               "includes": [7159]},
+        7154: {"name": "Abdominal Segmentation Type", "includes": []},
+        7159: {"name": "Lesion Segmentation Type", "includes": []},
+    }
+    DIRECT = {
+        7150: {("SCT", "91723000"), ("SCT", "49755003")},
+        7192: {("SCT", "91806002")},
+        7154: {("SCT", "10200004")},
+        7159: {("SCT", "108369006")},
+    }
+    LINKS = {(7150, "SCT", "91723000"): 7192, (7150, "SCT", "49755003"): 7194}
+
+    def check(self, category, type_code, category_scheme="SCT", type_scheme="SCT"):
+        pairs = {(category_scheme, category, "cat", type_scheme, type_code, "type"):
+                 {"segments": 1, "series": {"s"}}}
+        return dcmterm.property_check(pairs, self.GROUPS, self.DIRECT, self.LINKS)[0]
+
+    def test_membership_follows_includes_transitively(self):
+        members = dcmterm.cid_members(7151, self.GROUPS, self.DIRECT)
+        self.assertIn(("SCT", "10200004"), members)    # 7151 -> 7192 -> 7154
+        self.assertIn(("SCT", "108369006"), members)   # 7151 -> 7194 -> 7159
+        self.assertNotIn(("SCT", "91723000"), members)  # a category, not a type
+
+    def test_a_cycle_in_the_includes_terminates(self):
+        groups = {1: {"name": "a", "includes": [2]}, 2: {"name": "b", "includes": [1]}}
+        self.assertEqual(dcmterm.cid_members(1, groups, {2: {("X", "1")}}), {("X", "1")})
+
+    def test_liver_under_anatomical_structure_is_clean(self):
+        row = self.check("91723000", "10200004")
+        self.assertEqual(row["propertyIssue"], "")
+        self.assertEqual(row["typeInCategoryCid"], "True")
+        self.assertEqual(row["categoryTypeCid"], 7192)
+
+    def test_a_lesion_type_under_anatomical_structure_contradicts_the_category(self):
+        row = self.check("91723000", "108369006")
+        self.assertEqual(row["propertyIssue"], "TYPE_OUTSIDE_CATEGORY")
+        self.assertEqual(row["typeInCid7151"], "True")
+
+    def test_an_unlisted_type_is_low_not_a_contradiction(self):
+        row = self.check("91723000", "999999")
+        self.assertEqual(row["propertyIssue"], "TYPE_NOT_IN_CID")
+
+    def test_an_unlisted_category_is_reported(self):
+        self.assertIn("CATEGORY_NOT_IN_CID", self.check("123037004", "10200004")["propertyIssue"])
+
+    def test_private_scheme_is_not_judged(self):
+        row = self.check("91723000", "WIDGET", type_scheme="99LOCAL")
+        self.assertEqual(row["propertyIssue"], "")
+        self.assertIn("private", row["note"])
+
+    def test_retired_scheme_defers_to_issue_10(self):
+        row = self.check("T-D0050", "10200004", category_scheme="SRT")
+        self.assertEqual(row["propertyIssue"], "")
+        self.assertIn("issue 10", row["note"])
+
+    def test_tags_reach_the_triage_list(self):
+        rows = rows_for([type_coded("Tumor", "108369006", "Neoplasm")])
+        path = Path(__file__).resolve().parent / "_issue15.csv"
+        with open(path, "w", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=dcmterm.PROPERTY_COLUMNS)
+            writer.writeheader()
+            writer.writerow(self.check("91723000", "108369006"))
+        self.addCleanup(path.unlink)
+        properties = seg_checks.property_issues(path)
+        out = seg_checks.triage(rows, {}, set(), {}, {}, [], properties=properties)
+        self.assertIn("TYPE_OUTSIDE_CATEGORY", out[0]["issues"])
+        self.assertEqual(out[0]["worstSeverity"], "Medium")
+
+
+class TestDciodvfyBuildGuard(unittest.TestCase):
+    """A dciodvfy build that rejects -allpffgitems validates nothing. That must
+    never read as "no messages"."""
+
+    USAGE = ("-allpffgitems: unrecognized option\n"
+             "Usage: dciodvfy [-input-nolengthtoend] [-filename] [inputfile] <inputfile\n")
+
+    def test_the_rejected_option_is_recognised(self):
+        self.assertEqual(dciodvfy_check.unsupported_option(self.USAGE), "-allpffgitems")
+        self.assertEqual(dciodvfy_check.unsupported_option(DCIODVFY_OUTPUT), "")
+
+    def test_a_fake_old_build_is_a_failure_not_a_clean_object(self):
+        fake = Path(__file__).resolve().parent / "_old_dciodvfy.sh"
+        fake.write_text("#!/bin/sh\nprintf '%s\\n' '-allpffgitems: unrecognized option' "
+                        "'Usage: dciodvfy [-filename] [inputfile]' >&2\n")
+        fake.chmod(0o755)
+        self.addCleanup(fake.unlink)
+        text, failure = dciodvfy_check.run_one(str(fake), "x.dcm", 30)
+        self.assertIsNone(text)
+        self.assertIn("does not know -allpffgitems", failure)
+        with self.assertRaises(SystemExit):
+            dciodvfy_check.require_current_build(str(fake), "x.dcm", 30)
+
+    def test_provenance_does_not_lend_the_pip_version_to_a_foreign_binary(self):
+        line = dciodvfy_check.tool_provenance("/somewhere/else/dciodvfy")
+        self.assertIn("build unknown", line)
+
+    def test_segment_number_ordering_message_has_a_class(self):
+        """dciodvfy sees the item order that a table cannot; its message is
+        issue 16's, not OTHER. Text as a dicom3tools 20260901 build prints it."""
+        self.assertEqual(
+            dciodvfy_check.classify(
+                "SegmentNumber not monotonically increasing from one by one - have "
+                "SegmentSequence item number 2 with SegmentNumber 3"),
+            "SEGMENT_NUMBER_NOT_SEQUENTIAL")
+
+
+class TestMultiColumnCollection(unittest.TestCase):
+    """lookup_codes.py and dcmterm.py coverage read all three sequences; a code
+    used in two of them is one lookup that says where it was used."""
+
+    def table(self):
+        path = Path(__file__).resolve().parent / "_multi.csv"
+        path.write_text(
+            "SeriesInstanceUID,isBackgroundSegment,"
+            "AnatomicRegionCodingSchemeDesignator,AnatomicRegionCodeValue,"
+            "AnatomicRegionCodeMeaning,"
+            "SegmentedPropertyTypeCodingSchemeDesignator,SegmentedPropertyTypeCodeValue,"
+            "SegmentedPropertyTypeCodeMeaning\n"
+            "s1,False,SCT,10200004,Liver,SCT,10200004,Liver\n"
+            "s1,false,,,,SCT,78961009,Spleen\n"
+            "s1,true,,,,SCT,10200004,Background\n")
+        self.addCleanup(path.unlink)
+        return path
+
+    def test_lookup_collect_merges_across_sequences(self):
+        codes = lookup_codes.collect(self.table(), lookup_codes.DEFAULT_COLUMNS)
+        self.assertEqual(set(codes), {("SCT", "10200004"), ("SCT", "78961009")})
+        self.assertEqual(codes[("SCT", "10200004")]["sequences"],
+                         {"AnatomicRegion", "SegmentedPropertyType"})
+        self.assertEqual(codes[("SCT", "10200004")]["segments"], 2)
+
+    def test_dcmterm_batch_codes_records_sequences_and_skips_lowercase_background(self):
+        codes = dcmterm.batch_codes(self.table(), dcmterm.DEFAULT_COLUMNS)
+        self.assertEqual(codes[("SCT", "78961009")]["sequences"], {"SegmentedPropertyType"})
+        self.assertNotIn("Background", codes[("SCT", "10200004")]["meanings"])
+
+    def test_coverage_names_the_sequences_and_cids(self):
+        codes = dcmterm.batch_codes(self.table(), dcmterm.DEFAULT_COLUMNS)
+        cids = {("SCT", "10200004"): [(7154, "Abdominal Segmentation Type", "Liver")]}
+        row = {r["CodeValue"]: r for r in dcmterm.coverage(codes, DCM, cids)}["10200004"]
+        self.assertEqual(row["codeSequences"], "AnatomicRegion; SegmentedPropertyType")
+        self.assertEqual(row["cids"], "7154")
 
 
 if __name__ == "__main__":
