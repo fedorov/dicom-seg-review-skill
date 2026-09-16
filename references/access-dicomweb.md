@@ -117,6 +117,12 @@ https://viewer.imaging.datacommons.cancer.gov/viewer/{StudyInstanceUID}?SeriesIn
   issue 17 (Frame of Reference) is silent, and a referenced series the store does
   not hold goes unnoticed. A search that *fails* is recorded as found-but-unknown,
   so a flaky connection cannot manufacture a dangling reference.
+- **The segmented series' geometry.** Issue 18 needs the *source* series' grid, and a
+  DICOMweb store holding only segmentations does not have it. `seg_geometry.py`
+  resolves it through IDC instead — `--probe orientation` adds the
+  `ImageOrientationPatient` no IDC index carries. The segmentation's own grid is in
+  the metadata response and is extracted here like anywhere else, including the
+  per-frame fallback, since the response carries `PerFrameFunctionalGroupsSequence`.
 - **The "attribute absent from the schema" signal.** A BigQuery export tells you
   positively that *no* instance in the batch populates an attribute. Over DICOMweb you
   learn the same thing only by extracting everything and finding the column empty —
@@ -161,5 +167,6 @@ Issues 13, 14, 15 and 16 **do** run here: `RecommendedDisplayCIELabValue`,
 and type codes and the segment numbers are all in the metadata response, and
 `seg_attributes.py` extracts them. If the extractor's coverage summary lists an
 attribute as populated by no instance, that absence is the finding. Issue 17 runs
-with `--resolve-referenced`.
+with `--resolve-referenced`; issue 18 runs from `seg_geometry.py`, which resolves the
+segmented series through IDC rather than through the store.
 

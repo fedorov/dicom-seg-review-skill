@@ -1,5 +1,69 @@
 # Changelog
 
+## 1.5.0 — 2026-09-16
+
+One new check, and it is the first one here that does not look for a defect.
+
+- **Issue 18 - the segmentation's grid against the segmented series'.** For every
+  `(segmentation series, referenced series)` pair, `scripts/seg_geometry.py` asks
+  whether the segmented series is available - in IDC, or in a directory of the source
+  images - and, where it is, whether the two are sampled the same way: `Rows` and
+  `Columns`, `PixelSpacing`, `ImageOrientationPatient`, `SpacingBetweenSlices` and
+  `SliceThickness`. **Low throughout, and never a conformance verdict.** PS3.3 A.51.1
+  constrains the Frame of Reference (that is issue 17), not the sampling, so a
+  segmentation resampled to an isotropic grid or cropped to a bounding box is
+  conformant - the finding is a documented property of the delivery, and the report
+  gives it its own section rather than a place in the defect list. Folded into the
+  triage list with `seg_checks.py --geometry` as `GEOMETRY_DIFFERS`,
+  `SOURCE_NOT_IN_IDC` and `NO_REFERENCED_SERIES`, all Low.
+- **IDC is the fourth external authority**, through
+  [idc-index](https://github.com/ImagingDataCommons/idc-index), public and
+  unauthenticated. Three resolvers, tried in order per series, and the output records
+  which one answered: `--files` (exact, and the only free one); the IDC series-level
+  indices (existence, collection, and for CT, MR and PT the grid); and `--probe`,
+  which reads instance headers from IDC's open bucket by ranged HTTPS GET, ~16 KB
+  each. **`--probe orientation` is worth its cost**: no IDC index carries
+  `ImageOrientationPatient`, and without it the dimension that decides whether two
+  arrays are even indexed alike is never compared. `--probe full` reads every
+  instance and *measures* the slice spacing from the positions - a sample cannot,
+  since the smallest gap in half the slices is about twice the true spacing, and
+  `SliceThickness` is nominal and is not a substitute.
+- **Two absences are reported, and they matter more than any mismatch.** A referenced
+  series IDC does not hold; and an object that names no segmented *series* at all.
+  The second is commoner than it sounds - `ReferencedSeriesSequence` (0008,1115) is
+  the only series-level link a SEG has, and a batch recording its derivation per SOP
+  instance has none, which leaves issues 17 and 18 both silent. The new
+  `sourceImageReferenceLevel` column separates `SERIES` from `INSTANCE_ONLY` (the
+  link is there, per instance, and is conformant) and `NONE` (there is no link at
+  all). Reporting `INSTANCE_ONLY` as a missing reference would blame the producer for
+  a conformant object.
+- **Eight new columns in the per-segment table**, 61 to 69: `Rows`, `Columns`,
+  `PixelSpacing`, `SliceThickness`, `SpacingBetweenSlices`, `ImageOrientationPatient`,
+  `geometrySource` and `sourceImageReferenceLevel`. The four functional-group
+  attributes are read from the Shared groups where the macro is there and from the
+  Per-frame groups otherwise; an attribute whose frames **disagree** is left empty
+  with `geometrySource = PER_FRAME_VARYING`, because such an object has no one grid
+  and reporting the first frame's value would invent a comparison. `sql/01` gains the
+  same columns, with a `frameGeometry` CTE for the per-frame half.
+- **`sql/18_geometry.sql`.** With `@@IMAGE_TABLE@@` pointed at
+  `idc_current.dicom_all`, "is the segmented series available in IDC" *is* the join,
+  and the orientation comparison comes for free - `dicom_all` carries
+  `ImageOrientationPatient` per instance. The one thing it cannot do is *measure* the
+  slice spacing; it uses the source's declared `SpacingBetweenSlices` and is silent
+  otherwise.
+- **"Not compared" is kept distinct from "matches".** `GEOMETRY_MATCHES` means every
+  dimension agreed; `GEOMETRY_MATCHES_PARTIAL` means every dimension that *could* be
+  compared agreed. Only the `*_DIFFERS` observations become triage tags - a geometry
+  nobody looked at raises nothing, the same rule issue 17 follows for an unresolved
+  reference.
+- **Spacings are compared with a relative tolerance and orientations as an angle.**
+  `7.031003e-01` against a source's `0.7031` is one spacing written twice, and
+  `1\0\0\0\1\0` against `1.000000e+000\-2.038648e-010\...` is one plane; exact
+  comparisons would report a batch of false mismatches. Defaults: 0.001 relative,
+  0.1 degrees, both settable and both to be quoted in the report.
+- `make_fixture.py` gives `seg_bowel.dcm` a 2 mm grid over a 1 mm CT, so the fixture
+  exercises issue 18. 177 tests, up from 151.
+
 ## 1.4.0 — 2026-09-16
 
 The terminology checks now read the sequences that actually carry the anatomy,

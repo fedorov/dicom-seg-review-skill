@@ -12,7 +12,8 @@ Usage:
       --codes findings/codes.csv --review review.csv \\
       --property findings/issue15_property_context_group.csv \\
       --iod findings/issue9_iod_validation.csv \\
-      --encoding findings/encoding_per_object.csv
+      --encoding findings/encoding_per_object.csv \\
+      --geometry findings/issue18_geometry.csv
 
 Computed checks (issues 2, 4, 5, 6, 7, 10, 13, 14, 16, 17) need nothing but
 the data and will follow a new delivery. Issue 8 needs the fully specified
@@ -20,7 +21,10 @@ names from lookup_codes.py (--codes); issue 15 needs the context-group
 membership that dcmterm.py property computes (--property). Issue 9 is the IOD
 validator's verdict, read from dciodvfy_check.py via --iod, and issues 11 and
 12 come from seg_encoding.py via --encoding; those three need the files, so
-they are unavailable on the BigQuery and DICOMweb paths. Issues 1 and 3 are
+they are unavailable on the BigQuery and DICOMweb paths. Issue 18 is the
+geometry comparison seg_geometry.py makes against the segmented series, read
+via --geometry; it is Low throughout, because a segmentation sampled on a
+different grid is conformant. Issues 1 and 3 are
 curated: they need --review, and a review built against an earlier batch is
 STALE until re-derived. See SKILL.md, "Core rule".
 
@@ -40,6 +44,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import cielab  # noqa: E402  - same directory, stdlib only
+import seg_geometry  # noqa: E402  - same directory, stdlib only; for TAGS
 
 # Tag -> severity. CODE_AMBIGUOUS_ELSEWHERE is deliberately absent: it is a
 # property of a code across the whole population, not evidence about the series
@@ -80,6 +85,15 @@ SEVERITY = {
     "ALGORITHM_UNIDENTIFIED": "Low",
     "CATEGORY_NOT_IN_CID": "Low",
     "TYPE_NOT_IN_CID": "Low",
+    # Issue 18. Low throughout, and deliberately: a segmentation sampled on a
+    # different grid from its source is CONFORMANT - PS3.3 A.51.1 constrains
+    # the Frame of Reference, not the sampling - and whether IDC holds the
+    # segmented series says something about the delivery's provenance, not
+    # about the object. These are here so the triage list carries the fact,
+    # not so it ranks on it.
+    "GEOMETRY_DIFFERS": "Low",
+    "SOURCE_NOT_IN_IDC": "Low",
+    "NO_REFERENCED_SERIES": "Low",
 }
 TAG_ORDER = list(SEVERITY) + ["CODE_AMBIGUOUS_ELSEWHERE"]
 RANK = {"High": 0, "Medium": 1, "Low": 2, "None": 3}
@@ -815,6 +829,24 @@ def encoding_tags(path):
 # ---------------------------------------------------------------------------
 
 
+def geometry_tags(path):
+    """issue18_geometry.csv -> SeriesInstanceUID -> {tag: count of pairs}.
+
+    Three tags out of fifteen observations. Everything meaning "this could not
+    be compared" raises NOTHING: a geometry nobody looked at must read as
+    neither a match nor a mismatch, which is the same rule issue 17 follows for
+    an unresolved reference.
+    """
+    tags = defaultdict(Counter)
+    for row in load(path):
+        series = row["SeriesInstanceUID"]
+        for observation in (row.get("geometryObservation") or "").split("; "):
+            tag = seg_geometry.TAGS.get(observation.strip())
+            if tag:
+                tags[series][tag] += 1
+    return tags
+
+
 def type_repeats_category(rows):
     findings = []
     for row in rows:
@@ -1185,14 +1217,16 @@ def frame_of_reference(rows):
 
 def triage(rows, ambiguous, cosmetic, entire, verdicts, tracking,
            iod=None, colors=None, algorithms=None, encoding=None,
-           sequences=None, properties=None, numbering=None, frames=None):
+           sequences=None, properties=None, numbering=None, frames=None,
+           geometry=None):
     """One row per series, tagged, worst first.
 
     `ambiguous` / `cosmetic` are keyed (codeSequence, CodeValue) as
     ambiguous_codes returns them; `verdicts` is the dict load_review builds or
     a plain {(CodeValue, scheme, meaning): verdict}; `properties` is what
     property_issues reads from dcmterm.py; `numbering` and `frames` are the
-    findings of segment_numbers and frame_of_reference.
+    findings of segment_numbers and frame_of_reference; `geometry` is what
+    geometry_tags read from seg_geometry.py.
     """
     sequences = sequences or JUDGED_CODE_SEQUENCES
     ambiguous_tracking = {
@@ -1313,6 +1347,8 @@ def triage(rows, ambiguous, cosmetic, entire, verdicts, tracking,
             counts[tag] += count
         for tag, count in (encoding or {}).get(series, {}).items():
             counts[tag] += count
+        for tag, count in (geometry or {}).get(series, {}).items():
+            counts[tag] += count
         for tag, count in object_tags.get(series, {}).items():
             counts[tag] += count
 
@@ -1376,6 +1412,13 @@ def main():
         help="encoding_per_object.csv from seg_encoding.py; folds issues 11 "
         "and 12 (empty frames, compression) into the triage list. Local files "
         "only - both need the objects, not a metadata table.",
+    )
+    parser.add_argument(
+        "--geometry",
+        help="issue18_geometry.csv from seg_geometry.py; folds issue 18 (the "
+        "segmentation's grid against the segmented series', and whether that "
+        "series is in IDC) into the triage list. Low throughout - a different "
+        "grid is conformant.",
     )
     parser.add_argument(
         "--property",
@@ -1651,6 +1694,36 @@ def main():
         print("Issues 11, 12 skipped - run seg_encoding.py and pass --encoding "
               "(local files only)")
 
+    # ---- read from the geometry comparison, if it was run
+    geometry = None
+    if args.geometry:
+        geometry = geometry_tags(args.geometry)
+        pairs = load(args.geometry)
+        observed = Counter(
+            o for pair in pairs
+            for o in (pair.get("geometryObservation") or "").split("; ") if o)
+        differs = sum(
+            1 for pair in pairs
+            if any(seg_geometry.TAGS.get(o) == "GEOMETRY_DIFFERS"
+                   for o in (pair.get("geometryObservation") or "").split("; ")))
+        print(f"Issue 18 geometry         {differs:>6} of {len(pairs)} "
+              "(segmentation, segmented series) pairs are sampled\n"
+              "                                 differently - NOT a defect, "
+              "see issue 18")
+        for name, label in (
+            ("NO_REFERENCED_SERIES", "name no segmented series at all"),
+            ("SOURCE_NOT_IN_IDC", "segmented series is not in IDC"),
+            ("ORIENTATION_NOT_COMPARED",
+             "no source orientation (--probe orientation supplies it)"),
+            ("SLICE_SPACING_NOT_COMPARED",
+             "no source slice spacing (--probe full measures it)"),
+            ("GEOMETRY_MATCHES", "every dimension agreed"),
+        ):
+            if observed[name]:
+                print(f"           {name:<28} {observed[name]:>6}  {label}")
+    else:
+        print("Issue 18 skipped - run seg_geometry.py and pass --geometry")
+
     # ---- read from dcmterm.py property, if it was run
     properties = None
     if args.property:
@@ -1709,7 +1782,8 @@ def main():
     # ---- roll-up
     series = triage(rows, ambiguous, cosmetic, entire, verdicts, track, iod,
                     colors, algorithms, encoding, sequences=sequences,
-                    properties=properties, numbering=numbering, frames=frames)
+                    properties=properties, numbering=numbering, frames=frames,
+                    geometry=geometry)
     path = write(outdir, "series_triage.csv", series,
                  ["PatientID", "StudyInstanceUID", "SeriesInstanceUID", "issues",
                   "worstSeverity", "segmentCount", "segmentsNeedingRecode",

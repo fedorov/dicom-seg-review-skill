@@ -90,6 +90,13 @@ COLUMNS = [
     "SoftwareVersions",
     "segmentsInInstance",
     "numberOfFrames",
+    "Rows",
+    "Columns",
+    "PixelSpacing",
+    "SliceThickness",
+    "SpacingBetweenSlices",
+    "ImageOrientationPatient",
+    "geometrySource",
     "referencedSeriesInstanceUID",
     "referencedModality",
     "referencedBodyPartExamined",
@@ -97,6 +104,7 @@ COLUMNS = [
     "referencedSeriesFound",
     "referencedInstanceCount",
     "referencedSeriesCount",
+    "sourceImageReferenceLevel",
     "isBackgroundSegment",
     "multiValuedCodeSequence",
     "viewer_url",
@@ -193,6 +201,129 @@ def _scalar(ds, keyword, default=""):
     if isinstance(value, (list, tuple)) or type(value).__name__ == "MultiValue":
         value = value[0] if len(value) else None
     return "" if value is None else str(value)
+
+
+# The four geometry attributes issue 18 compares, in the order _plane returns
+# them. All four live in the Multi-frame Functional Groups, which is where a
+# SEG records its grid: PixelSpacing / SliceThickness / SpacingBetweenSlices in
+# Pixel Measures (PS3.3 C.7.6.16.2.1) and ImageOrientationPatient in Plane
+# Orientation (C.7.6.16.2.4). Rows and Columns are top-level, Type 1.
+GEOMETRY_FIELDS = (
+    "PixelSpacing",
+    "SliceThickness",
+    "SpacingBetweenSlices",
+    "ImageOrientationPatient",
+)
+
+# Weakest-wins order for geometrySource. A macro may be shared for one
+# attribute and per-frame for another, so the object's single word is the
+# weakest of the four - PER_FRAME_VARYING beats everything, because an object
+# whose frames disagree has no one grid to compare.
+GEOMETRY_SOURCES = ("SHARED", "PER_FRAME_UNIFORM", "PER_FRAME_VARYING")
+
+
+def _numbers(value):
+    """A multi-valued DICOM number as "a/b/c", kept verbatim.
+
+    Verbatim because the table records what the object says: "1.000000" and
+    "1.0" are the same spacing and different strings, and normalising here
+    would hide which one the producer wrote. seg_geometry.py parses floats when
+    it compares.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, (list, tuple)) or type(value).__name__ == "MultiValue":
+        return "/".join(str(v) for v in value)
+    return str(value)
+
+
+def _plane(item):
+    """GEOMETRY_FIELDS of one functional group item, as strings.
+
+    `item` is a Shared or Per-frame Functional Groups item; a macro it does not
+    carry yields "" for that field, which is what lets the caller fall back to
+    the other place the macro can be.
+    """
+    if item is None:
+        return ("",) * len(GEOMETRY_FIELDS)
+    measures = _first(getattr(item, "PixelMeasuresSequence", None))
+    orientation = _first(getattr(item, "PlaneOrientationSequence", None))
+    return (
+        _numbers(getattr(measures, "PixelSpacing", None)),
+        _numbers(getattr(measures, "SliceThickness", None)),
+        _numbers(getattr(measures, "SpacingBetweenSlices", None)),
+        _numbers(getattr(orientation, "ImageOrientationPatient", None)),
+    )
+
+
+def _geometry(ds):
+    """The SEG's own grid: Rows, Columns, the four GEOMETRY_FIELDS, and where
+    they were found. Issue 18 compares these against the segmented series.
+
+    Each field is taken from the Shared Functional Groups where the macro is
+    there, and otherwise from the Per-frame groups - both are legal, and dcmqi
+    shares while some producers do not. A field whose per-frame values DISAGREE
+    is left EMPTY, not set to the first frame's: an object whose frames have
+    different spacings has no single grid, and writing one frame's value would
+    invent a comparison. `geometrySource` says which case this was, so an empty
+    value can be told apart from an absent macro.
+    """
+    shared = _plane(_first(getattr(ds, "SharedFunctionalGroupsSequence", None)))
+    frames = [_plane(f)
+              for f in (getattr(ds, "PerFrameFunctionalGroupsSequence", None) or [])]
+
+    row = {"Rows": _scalar(ds, "Rows"), "Columns": _scalar(ds, "Columns")}
+    sources = []
+    for i, field in enumerate(GEOMETRY_FIELDS):
+        if shared[i]:
+            row[field] = shared[i]
+            sources.append("SHARED")
+            continue
+        distinct = {plane[i] for plane in frames if plane[i]}
+        if not distinct:
+            row[field] = ""
+        elif len(distinct) == 1:
+            row[field] = distinct.pop()
+            sources.append("PER_FRAME_UNIFORM")
+        else:
+            row[field] = ""
+            sources.append("PER_FRAME_VARYING")
+    row["geometrySource"] = (
+        max(sources, key=GEOMETRY_SOURCES.index) if sources else "ABSENT"
+    )
+    return row
+
+
+def _reference_level(ds, referenced_series_uid):
+    """How, if at all, this object says which images it segments.
+
+    SERIES        ReferencedSeriesSequence (0008,1115) names a
+                  SeriesInstanceUID. The only SERIES-LEVEL link a SEG has, and
+                  the only one issues 17 and 18 can follow.
+    INSTANCE_ONLY no such sequence, but the object names source SOP instances -
+                  in Source Image Sequence (0008,2112), Referenced Image
+                  Sequence (0008,1140), or per-frame Derivation Image. The
+                  derivation is recorded, but recovering the series from it
+                  needs an instance-level index, which neither idc-index nor a
+                  DICOMweb series query provides. Common in older converted
+                  batches.
+    NONE          nothing in the object connects it to any image.
+
+    The distinction matters because "no referenced series" reads as a producer
+    error and INSTANCE_ONLY is not one - it is a conformant object whose link a
+    series-level consumer cannot follow.
+    """
+    if referenced_series_uid:
+        return "SERIES"
+    for keyword in ("SourceImageSequence", "ReferencedImageSequence"):
+        if _first(getattr(ds, keyword, None)) is not None:
+            return "INSTANCE_ONLY"
+    for frame in getattr(ds, "PerFrameFunctionalGroupsSequence", None) or []:
+        derivation = _first(getattr(frame, "DerivationImageSequence", None))
+        if derivation is not None and _first(
+                getattr(derivation, "SourceImageSequence", None)) is not None:
+            return "INSTANCE_ONLY"
+    return "NONE"
 
 
 def _algorithm_identification(segment):
@@ -310,7 +441,14 @@ def extract_instance(ds, viewer_url_pattern=None, collection="", referenced=None
         ),
         "referencedSeriesCount": str(
             len(getattr(ds, "ReferencedSeriesSequence", None) or [])),
+        # Issue 18. Tells "this object names no source series" apart from
+        # "this object names its source per instance, which no series-level
+        # lookup can follow".
+        "sourceImageReferenceLevel": _reference_level(ds, ref_series_uid),
     }
+
+    # Issue 18. Object level, so it goes in `instance` alongside the rest.
+    instance.update(_geometry(ds))
 
     if viewer_url_pattern:
         instance["viewer_url"] = viewer_url_pattern.format(

@@ -25,7 +25,10 @@ Five files, chosen so that most checks have one thing to find and one to pass:
                       (issue 2); category Anatomical Structure over a Neoplasm
                       type (issue 15); segments numbered 1 and 3 (issue 16);
                       SRT designator on the category (issue 10); Frame of
-                      Reference differing from ct_b.dcm (issue 17).
+                      Reference differing from ct_b.dcm (issue 17); and a 2 mm
+                      grid over a 1 mm CT (issue 18 - conformant, documented).
+  seg_labelmap.dcm    ... and no segmented series IDC or the directory holds,
+                      so issue 18 reports the absence too.
   seg_labelmap.dcm    LABELMAP with a Background segment 0, referencing a
                       series that is not in the directory (issue 17, dangling).
   ct_a.dcm, ct_b.dcm  one slice each of the two referenced CT series, so
@@ -173,13 +176,20 @@ def segment_item(number, label, category, seg_type, algorithm_type="MANUAL",
     return item
 
 
-def functional_groups(ds, frames, referenced_ct, referenced_ct_class=CT_IMAGE):
-    """Shared and per-frame groups for `frames`, a list of (segment number, slice index)."""
+def functional_groups(ds, frames, referenced_ct, referenced_ct_class=CT_IMAGE,
+                      spacing=1.0):
+    """Shared and per-frame groups for `frames`, a list of (segment number, slice index).
+
+    `spacing` sets the in-plane pixel spacing, the slice thickness and the
+    spacing between slices together. The CT slices are written at 1.0, so
+    anything else is a segmentation sampled on a grid of its own - issue 18,
+    which is a documented property and not a defect.
+    """
     shared = Dataset()
     measures = Dataset()
-    measures.PixelSpacing = [1.0, 1.0]
-    measures.SliceThickness = 1.0
-    measures.SpacingBetweenSlices = 1.0
+    measures.PixelSpacing = [spacing, spacing]
+    measures.SliceThickness = spacing
+    measures.SpacingBetweenSlices = spacing
     shared.PixelMeasuresSequence = Sequence([measures])
     orientation = Dataset()
     orientation.ImageOrientationPatient = [1, 0, 0, 0, 1, 0]
@@ -253,7 +263,8 @@ def new_seg(directory, name, sop_class, study, frame_of_reference, description):
 
 def write_binary_seg(directory, name, study, frame_of_reference, ct_series, ct_instance,
                      segments, frames_per_segment, description, colour=None,
-                     algorithm_type="MANUAL", algorithm_name=None, overlap="NO"):
+                     algorithm_type="MANUAL", algorithm_name=None, overlap="NO",
+                     spacing=1.0):
     """`segments` is a list of (number, label, category, type) where category and
     type are (value, meaning) or (value, meaning, scheme) tuples."""
     ds = new_seg(directory, name, SEGMENTATION, study, frame_of_reference, description)
@@ -272,7 +283,7 @@ def write_binary_seg(directory, name, study, frame_of_reference, ct_series, ct_i
         for slice_index, frame in enumerate(frames_per_segment[number]):
             frames.append((number, slice_index))
             bits.append(frame)
-    functional_groups(ds, frames, ct_instance)
+    functional_groups(ds, frames, ct_instance, spacing=spacing)
     referenced_series(ds, ct_series, ct_instance)
     ds.PixelData = pack_bits(bits)
     ds.save_as(str(directory / f"{name}.dcm"), enforce_file_format=True)
@@ -352,7 +363,7 @@ def main():
         frames_per_segment={1: [disc(5, 5, 4) for _ in range(SLICES)],
                             3: [disc(5, 5, 1) for _ in range(SLICES)]},
         description="Fixture bowel: ambiguous code, category/type contradiction",
-        overlap="UNDEFINED")
+        overlap="UNDEFINED", spacing=2.0)
 
     # A labelmap referencing a series that is not here.
     write_labelmap_seg(directory, "seg_labelmap", study, frame_a, uid("7.ct_c"), uid("1.ct_c"))

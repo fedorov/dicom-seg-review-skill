@@ -12,6 +12,11 @@ viewer will draw in the same colour, a BINARY object that shipped a thousand all
 frames uncompressed, and an AI-produced segmentation that does not say which model
 produced it.
 
+It also documents, without calling it a defect, how each segmentation's grid relates
+to the grid of the series it segments — resolving that series through
+[IDC](https://imaging.datacommons.cancer.gov) — and whether the segmented series is
+available at all.
+
 ## Install
 
 ```bash
@@ -34,20 +39,22 @@ dependencies listed below.
 ## Three access paths, one table
 
 Whether the metadata is in BigQuery, a DICOMweb store, or a directory of files, every
-path produces the **same 61-column per-segment table**, and every check runs on that.
+path produces the **same 69-column per-segment table**, and every check runs on that.
 
 ```
 BigQuery metadata table ─┐
 DICOMweb store ──────────┼─> seg_attributes (one row per segment) ─┬─> report
 Directory of .dcm files ─┤                                         │
                          ├─> dciodvfy      (files only) ───────────┤
-                         └─> seg_encoding  (files only) ───────────┴─> triage CSV
+                         ├─> seg_encoding  (files only) ───────────┤
+                         └─> seg_geometry  (+ IDC) ────────────────┴─> triage CSV
 ```
 
 Three checks need the objects: issue 9 runs `dciodvfy`, issue 11 reads the pixel
 data, issue 12 reads the transfer syntax. Issue 17 needs the referenced image series
-resolved. Where a path cannot run a check, the triage list is *silent* about it, not
-clean, and the report says so.
+resolved, and issue 18 needs that series' own geometry — from IDC, or from a directory
+of the source images. Where a path cannot run a check, the triage list is *silent*
+about it, not clean, and the report says so.
 
 ## Usage
 
@@ -58,6 +65,8 @@ step there carries its commands. The shortest useful run, on local files:
 python scripts/seg_attributes.py --files /path/to/delivery --resolve-referenced -o seg_attributes.csv
 python scripts/seg_checks.py seg_attributes.csv --outdir findings/
 python scripts/dcmterm.py coverage seg_attributes.csv -o findings/coverage.csv
+python scripts/seg_geometry.py seg_attributes.csv --probe orientation \
+    -o findings/issue18_geometry.csv
 ```
 
 `python scripts/make_fixture.py /tmp/seg-fixture` writes a small synthetic delivery
@@ -68,7 +77,7 @@ with known defects, to see every output once before touching real data.
 ```
 SKILL.md                             the method: workflow, severity scale, traps
 references/
-  issue-catalogue.md                 the seventeen checks, with DICOM references
+  issue-catalogue.md                 the eighteen checks, with DICOM references
   terminology.md                     which sequence carries the anatomy; judging codes;
                                      the review table; SNOMED flavours; laterality
   reporting.md                       writing the report and the triage list
@@ -80,15 +89,16 @@ scripts/
   seg_checks.py                      run the computed checks + triage roll-up
   dciodvfy_check.py                  validate objects against the IOD with dciodvfy
   seg_encoding.py                    empty frames + compression, from the objects
+  seg_geometry.py                    the segmentation's grid against the segmented series'
   dcmterm.py                         codes against DICOM's own code set and context groups
   lookup_codes.py                    resolve codes to fully specified names
   cielab.py                          DICOM's CIELab: parse, compare, draw a swatch
   make_fixture.py                    a synthetic five-file delivery with known defects
-  sql/                               the same checks as BigQuery templates, 01–17
+  sql/                               the same checks as BigQuery templates, 01–18
 templates/
   review.csv                         the curated verdict table's header, with two examples
 tests/
-  test_seg_review.py                 151 tests over the extraction and check logic
+  test_seg_review.py                 177 tests over the extraction and check logic
 requirements.txt                     every optional dependency
 ```
 
@@ -101,6 +111,7 @@ requirements.txt                     every optional dependency
 | `seg_attributes.py --files`, `seg_encoding.py`, `make_fixture.py`, the tests | `pydicom>=3.0` |
 | `dciodvfy_check.py` | `dicom3tools` (for `dciodvfy`) and `pydicom>=3.0` |
 | `seg_attributes.py --dicomweb` | `dicomweb-client>=0.59`, plus `[gcp]` and `google-auth` for Healthcare API stores |
+| `seg_geometry.py` | `idc-index>=0.12.0` for the IDC lookup; `pydicom>=3.0` for `--files` and `--probe`. Neither is needed to read an existing result |
 | `scripts/sql/` | the `bq` CLI |
 | `lookup_codes.py` | network access to `tx.fhir.org` (public, no auth) |
 | `dcmterm.py` | one download from [fedorov/dcmterms](https://github.com/fedorov/dcmterms) (public, ~1 MB, cached) |
@@ -118,10 +129,11 @@ or one build, on one day:
 | [**dcmterms**](https://github.com/fedorov/dcmterms) | every coded entry in DICOM PS3.16's context groups, and how the groups include one another, as Parquet — what DICOM *expects* |
 | [**tx.fhir.org**](https://tx.fhir.org) | all of SNOMED CT — fully specified names, retired concepts, everything dcmterms does not cover |
 | [**dicom3tools**](https://github.com/ImagingDataCommons/dicom3tools-python-distributions) | `dciodvfy`, David Clunie's IOD validator — structure against PS3.3. It checks no context group, so it says nothing about whether the coding is right |
+| [**IDC**](https://imaging.datacommons.cancer.gov) | via [idc-index](https://github.com/ImagingDataCommons/idc-index): whether the segmented series is public, and its grid. No credentials; `--probe` reads instance headers from the open bucket by ranged HTTPS GET. Cite the IDC version `get_idc_version()` reports |
 
 The first two are the terminology pair, and neither alone is enough: a review that
 joins only dcmterms **silently passes everything it does not cover**. See "The coverage
-trap" in `SKILL.md`. The third is orthogonal to both.
+trap" in `SKILL.md`. The third and fourth are orthogonal to both and to each other.
 
 ## Verification
 
@@ -130,9 +142,10 @@ pip install pydicom          # the only thing the suite needs
 python tests/test_seg_review.py
 ```
 
-151 tests over extraction, the check logic, colour, algorithm identification, empty
+177 tests over extraction, the check logic, colour, algorithm identification, empty
 frames, the terminology comparison, context-group membership, segment numbering,
-frame-of-reference integrity, the review-table contract, the `dciodvfy -new`
+frame-of-reference integrity, geometry against the segmented series, the
+review-table contract, the `dciodvfy -new`
 output parser and the guard against a dciodvfy build that rejects its flags. Terminology tests run against a stub table and validator tests against
 captured output, so the suite needs neither network, nor dicom3tools, nor fixture
 files.
@@ -143,7 +156,8 @@ DICOM SEG only. RTSTRUCT has a different structure and different failure modes.
 
 **The boundary is what the voxels mean.** Nothing here interprets what was segmented,
 so it will not tell you whether a segmentation is anatomically correct — only whether
-the object says what it means. Structure and semantics are checked separately:
+the object says what it means. Issue 18 compares the segmentation's grid with its
+source's, which is arithmetic over metadata, not a judgement about the voxels. Structure and semantics are checked separately:
 `dciodvfy` decides whether the object conforms to the IOD; the terminology work decides
 whether the codes mean what the labels say. A batch can pass one comprehensively and
 fail the other.

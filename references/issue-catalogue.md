@@ -1,7 +1,10 @@
 # Issue catalogue
 
-The seventeen checks. Each gives what the defect is, why it matters, how to detect
+The eighteen checks. Each gives what the defect is, why it matters, how to detect
 it, and what the finding looks like in practice.
+
+Seventeen of them look for defects. Issue 18 does not: it documents how a
+segmentation's grid relates to its source's, where neither answer is a failure.
 
 Numbering is stable. Add new issues with the next free number; do not renumber, since
 reports cite these.
@@ -806,3 +809,147 @@ which it was; `sql/17_frame_of_reference.sql` is the BigQuery form.
 
 Only the first item of `ReferencedSeriesSequence` is compared;
 `referencedSeriesCount` says when there were more.
+
+**This check is silent on an object that names no referenced series at all**, which is
+commoner than it sounds: `ReferencedSeriesSequence` is the only series-level link a SEG
+has, and a batch that records its derivation per SOP instance instead has none. Issue
+18 reports that case as `NO_REFERENCED_SERIES`, with `sourceImageReferenceLevel`
+separating "the link is recorded per instance" from "there is no link at all".
+
+---
+
+## 18. The segmentation's grid against the segmented series'
+
+**Severity: Low throughout, and not a conformance verdict at all.**
+**Layer: computed, where the segmented series is resolved.**
+
+Two questions about the relationship between a segmentation and the images it was
+drawn on, neither of which has a pass or a fail:
+
+1. **Is the segmented series there at all?** — both whether the object names one, and
+   whether whoever holds the images has it.
+2. **Where it is there, do the two grids agree?** — `Rows` and `Columns`, in-plane
+   `PixelSpacing`, `ImageOrientationPatient`, `SpacingBetweenSlices`, `SliceThickness`.
+
+**A different grid is not a defect.** PS3.3 A.51.1 constrains the Frame of Reference —
+that is issue 17, and it *is* a rule — but it says nothing about the sampling. A
+segmentation resampled to an isotropic grid, or cropped to a bounding box around the
+organ, is conformant, and is often what the producer intended. What a mismatch costs
+is that a consumer cannot overlay or compare the two voxel-wise without resampling
+first, and resampling a label map means choosing an interpolator, which is a decision
+somebody has to make knowingly. So the finding is a **documented property of the
+delivery**, and the report should present it as a table of what was compared, never in
+the defect list. Do not let it raise a series' severity above Low.
+
+```bash
+python scripts/seg_geometry.py seg_attributes.csv -o findings/issue18_geometry.csv \
+    --probe orientation
+python scripts/seg_checks.py seg_attributes.csv --outdir findings/ \
+    --geometry findings/issue18_geometry.csv
+```
+
+### The two absences, which matter more than any mismatch
+
+| `geometryObservation` | Meaning |
+|---|---|
+| `NO_REFERENCED_SERIES` | The object names no segmented **series**. Read `sourceImageReferenceLevel` next to it. |
+| `SOURCE_NOT_IN_IDC` | It names one, and IDC does not hold it. |
+
+`ReferencedSeriesSequence` (0008,1115) is the **only series-level link a SEG has**.
+Where it is absent, `sourceImageReferenceLevel` separates two very different
+situations, and conflating them is the trap here:
+
+| `sourceImageReferenceLevel` | Meaning |
+|---|---|
+| `SERIES` | `ReferencedSeriesSequence` names a `SeriesInstanceUID`. The normal case, and the only one issues 17 and 18 can follow. |
+| `INSTANCE_ONLY` | No such sequence, but the object *does* name its source SOP instances — Source Image (0008,2112), Referenced Image (0008,1140), or the per-frame Derivation Image group. **The derivation is recorded**; recovering the series from it needs an instance-level index, which neither idc-index nor a series-level DICOMweb query provides. Common in older converted batches. |
+| `NONE` | Nothing in the object connects it to any image. |
+
+`INSTANCE_ONLY` is conformant and is not a producer error — say so, rather than
+reporting "no referenced series" as though the link were missing. What it costs is
+concrete and worth stating: issues 17 and 18 are both **silent** on those objects, and
+a viewer that resolves the source by series will not find it.
+
+**`SOURCE_NOT_IN_IDC` has to be interpreted before it is reported.** For a delivery
+derived from IDC it means the images cannot be re-fetched and the segmentation cannot
+be reproduced. For a delivery over private images it means nothing at all. Report the
+*proportion* first — "3 of 412 referenced series are not in IDC" is a finding; "412 of
+412 are not" is a statement that these are not IDC images — and only then the list.
+
+### The comparison, and what each dimension needs
+
+`seg_geometry.py` resolves the segmented series three ways, in this order per series.
+They differ in what they can reach, and the CSV says which was used in
+`sourceResolvedBy`:
+
+| Resolver | Reaches | Cost |
+|---|---|---|
+| `--files DIR` | everything, exactly, including the measured slice spacing | free |
+| IDC index (default) | existence, collection, and — for CT, MR and PT only — `Rows`, `Columns`, `PixelSpacing`, `SliceThickness` | one parquet download, cached |
+| `--probe orientation` | **`ImageOrientationPatient`**, plus the rest from the object itself | one ~16 KB ranged HTTPS GET per series |
+| `--probe full` | the **measured** slice spacing | one per instance |
+
+**No IDC index carries `ImageOrientationPatient`.** Without `--probe` or `--files`, the
+orientation is reported `ORIENTATION_NOT_COMPARED` — which is the dimension most worth
+having, because an orientation mismatch means the two arrays are not even indexed the
+same way. Budget one `--probe orientation` pass.
+
+**A sample cannot measure a slice spacing.** The spacing is the median gap between
+consecutive `ImagePositionPatient` projections onto the slice normal, and the smallest
+gap in a random half of the slices is about twice the true spacing. `--probe full`
+therefore reads every instance or none; a series above `--probe-limit` falls back to
+one instance and its spacing stays `NOT_COMPARED`. `SliceThickness` is **not** a
+substitute: it is nominal, and says nothing about gaps or overlap between slices.
+
+### Reading the result
+
+| `geometryObservation` | |
+|---|---|
+| `GRID_SIZE_DIFFERS` | `Rows` / `Columns` differ |
+| `PIXEL_SPACING_DIFFERS` | in-plane spacing differs beyond the relative tolerance |
+| `ORIENTATION_DIFFERS` | the two planes are more than `--orientation-tolerance` apart |
+| `SLICE_SPACING_DIFFERS` | `SpacingBetweenSlices` differs from the source's |
+| `SLICE_THICKNESS_DIFFERS` | `SliceThickness` differs from the source's |
+| `SEG_GEOMETRY_PER_FRAME` | the segmentation's own frames disagree, so it has no one grid |
+| `SEG_GEOMETRY_ABSENT` | it carries no Pixel Measures or Plane Orientation at all |
+| `*_NOT_COMPARED`, `SOURCE_GEOMETRY_UNAVAILABLE` | **silence, not a match** |
+| `GEOMETRY_MATCHES` | every dimension agreed |
+| `GEOMETRY_MATCHES_PARTIAL` | every dimension that *could* be compared agreed |
+
+The two `MATCHES` values are split for the reason the rest of this skill splits
+"unchecked" from "clean": a row saying `GEOMETRY_MATCHES` beside
+`ORIENTATION_NOT_COMPARED` reads as "the grids agree" when the orientation was never
+looked at.
+
+### Traps
+
+- **Compare spacings with a *relative* tolerance, never exactly.** Producers write the
+  same number differently: `7.031003e-01` against a source's `0.7031` is one spacing
+  written twice, and an exact comparison reports a batch of false mismatches. The
+  default is 0.001 relative, which accepts that and still separates 1.0 mm from 1.25 mm.
+- **Compare orientations as an angle, not as text.** `1\0\0\0\1\0` and
+  `1.000000e+000\-2.038648e-010\...` are the same plane. `seg_geometry.py` reports the
+  larger of the row and column rotations in `orientationAngleDegrees`; a slice normal
+  alone would miss an in-plane rotation, which changes which voxel is which.
+- **An attribute whose instances disagree is dropped, not averaged.** A source series
+  with two in-plane spacings has no spacing to compare against, and reporting the first
+  instance's would compare the segmentation against a grid that does not exist. IDC's
+  `volume_geometry_index` says the same thing at series level, and
+  `sourceVolumeIsRegular` carries it through.
+- **The segmentation's own geometry may be per-frame.** Pixel Measures and Plane
+  Orientation are legal in either functional groups macro. `geometrySource` says which
+  it was; `PER_FRAME_VARYING` means the object itself has no single grid, which is a
+  more interesting finding than any mismatch.
+- **Only the first referenced series is compared.** `MULTIPLE_REFERENCED_SERIES` says
+  when there were more; the per-segment table carries only the first.
+
+### On BigQuery
+
+`sql/18_geometry.sql`, with `@@IMAGE_TABLE@@` pointed at
+`bigquery-public-data.idc_current.dicom_all` — on that path "is the segmented series
+available in IDC" *is* the join, and the orientation comes for free because
+`dicom_all` carries `ImageOrientationPatient` per instance. The one comparison the SQL
+cannot make is the **measured** slice spacing; it uses the source's declared
+`SpacingBetweenSlices` where there is one, and is silent otherwise. Give it the same
+`@@SPACING_TOLERANCE@@` the script was given, or the two will disagree about which
+series are tagged.

@@ -143,6 +143,36 @@ needs it. PS3.3 C.8.20.2 forbids `RecommendedDisplayCIELabValue` on a LABELMAP o
 whose Photometric Interpretation is PALETTE COLOR, and that rule cannot be evaluated
 without it.
 
+## Issue 18 — geometry against the segmented series
+
+`seg_attributes.py` extracts the segmentation's own grid on every run: `Rows`,
+`Columns`, and `PixelSpacing` / `SliceThickness` / `SpacingBetweenSlices` /
+`ImageOrientationPatient` from the Pixel Measures and Plane Orientation macros,
+read from the Shared Functional Groups where they are there and from the Per-frame
+groups otherwise. `geometrySource` says which, and an attribute whose frames disagree
+is left **empty** with `geometrySource = PER_FRAME_VARYING`, because such an object
+has no one grid to compare.
+
+The other half of the comparison is the segmented series, and this is the one place
+where local files are the *best* source:
+
+```bash
+python scripts/seg_geometry.py seg_attributes.csv --files /path/to/delivery \
+    -o findings/issue18_geometry.csv
+```
+
+If the delivery holds the source images alongside the segmentations, `--files` reads
+them directly: the whole geometry, exactly, including the slice spacing measured from
+the instance positions rather than inferred from the nominal `SliceThickness`. Where
+it does not, the script falls back to IDC, which reaches everything except the
+orientation unless `--probe` is given. Both resolvers can run in one invocation — a
+series found on disk is never looked up remotely.
+
+`sourceImageReferenceLevel` is also extracted here, and the local path is the only one
+that fills it completely: it reads the per-frame Derivation Image groups, so an object
+whose only link to its source is per-frame is reported `INSTANCE_ONLY` rather than
+`NONE`.
+
 ## What is missing compared to the other paths
 
 - **Collection / project membership.** Not in the object unless `ClinicalTrial*`

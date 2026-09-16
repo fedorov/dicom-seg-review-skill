@@ -44,6 +44,12 @@
 # scripts/seg_encoding.py over the files, or say in the report that the
 # encoding was not reviewed.
 #
+# NOTE ON THE PER-FRAME DERIVATION of the sourceImageReferenceLevel column: it
+# reads the two TOP-LEVEL instance-reference sequences only. An object whose
+# only link is the per-frame Derivation Image functional group is reported NONE
+# here and INSTANCE_ONLY by seg_attributes.py, which reads the frames. Where
+# that distinction matters, extract with the script.
+#
 # The code sequences are taken at SAFE_OFFSET(0). `multiValuedCodeSequence` is
 # the guard that says so, and is the one derived column here because it protects
 # every query built on this view. Confirm it is FALSE everywhere before
@@ -70,7 +76,19 @@ WITH
       ManufacturerModelName,
       SoftwareVersions,
       NumberOfFrames,
+      Rows,
+      Columns,
       SegmentSequence,
+      # Issue 18 - the segmentation's own grid. Pixel Measures and Plane
+      # Orientation may be shared or per-frame; the shared item is read here
+      # and the per-frame fallback is the frameGeometry CTE below.
+      SharedFunctionalGroupsSequence[SAFE_OFFSET(0)] AS sharedGroups,
+      PerFrameFunctionalGroupsSequence,
+      # Issue 18 - how, if at all, the object says which images it segments.
+      # ReferencedSeriesSequence is the only SERIES-level link; these two are
+      # the instance-level ones, which no series-level lookup can follow.
+      ARRAY_LENGTH(SourceImageSequence) AS sourceImageCount,
+      ARRAY_LENGTH(ReferencedImageSequence) AS referencedImageCount,
       ARRAY_LENGTH(ReferencedSeriesSequence) AS referencedSeriesCount,
       ReferencedSeriesSequence[SAFE_OFFSET(0)] AS referencedSeries
     FROM
@@ -110,6 +128,61 @@ WITH
         SELECT referencedSeries.SeriesInstanceUID FROM segInstances)
     GROUP BY
       SeriesInstanceUID
+  ),
+
+  # Issue 18, the per-frame half. Pixel Measures (C.7.6.16.2.1) and Plane
+  # Orientation (C.7.6.16.2.4) are legal in EITHER functional groups macro, and
+  # producers differ: dcmqi shares them, others repeat them per frame. Reading
+  # the shared item alone would leave the geometry of a per-frame object empty,
+  # which the comparison cannot tell apart from a source with no geometry.
+  #
+  # The count is what makes this safe. A value is usable only when every frame
+  # agrees on it - an object whose frames have different spacings has no single
+  # grid, and reporting the first frame's would compare the segmentation
+  # against a grid that does not exist. seg_geometry.py applies the same rule.
+  #
+  # DELETE THIS CTE, and the COALESCEs that read it, if the scan cost is not
+  # worth it - the columns then describe shared-only objects and are NULL for
+  # the rest, and geometrySource says which.
+  frameGeometry AS (
+    SELECT
+      SOPInstanceUID,
+      COUNT(DISTINCT pixelSpacing) AS pixelSpacings,
+      ANY_VALUE(pixelSpacing) AS pixelSpacing,
+      COUNT(DISTINCT sliceThickness) AS sliceThicknesses,
+      ANY_VALUE(sliceThickness) AS sliceThickness,
+      COUNT(DISTINCT spacingBetweenSlices) AS spacingsBetweenSlices,
+      ANY_VALUE(spacingBetweenSlices) AS spacingBetweenSlices,
+      COUNT(DISTINCT imageOrientationPatient) AS imageOrientationPatients,
+      ANY_VALUE(imageOrientationPatient) AS imageOrientationPatient
+    FROM (
+      SELECT
+        segInstances.SOPInstanceUID,
+        ARRAY_TO_STRING(
+          ARRAY(
+            SELECT CAST(component AS STRING)
+            FROM UNNEST(
+              frame.PixelMeasuresSequence[SAFE_OFFSET(0)].PixelSpacing)
+              AS component),
+          '/') AS pixelSpacing,
+        CAST(frame.PixelMeasuresSequence[SAFE_OFFSET(0)].SliceThickness
+          AS STRING) AS sliceThickness,
+        CAST(frame.PixelMeasuresSequence[SAFE_OFFSET(0)].SpacingBetweenSlices
+          AS STRING) AS spacingBetweenSlices,
+        ARRAY_TO_STRING(
+          ARRAY(
+            SELECT CAST(component AS STRING)
+            FROM UNNEST(
+              frame.PlaneOrientationSequence[SAFE_OFFSET(0)]
+                .ImageOrientationPatient) AS component),
+          '/') AS imageOrientationPatient
+      FROM
+        segInstances
+      CROSS JOIN
+        UNNEST(segInstances.PerFrameFunctionalGroupsSequence) AS frame
+    )
+    GROUP BY
+      SOPInstanceUID
   )
 
 SELECT
@@ -399,6 +472,94 @@ SELECT
   SAFE_CAST(segInstances.NumberOfFrames AS INT64) AS numberOfFrames,
 
   # description:
+  # DICOM Rows (0028,0010) of the segmentation object. Issue 18 compares it
+  # with the segmented series'.
+  segInstances.Rows,
+
+  # description:
+  # DICOM Columns (0028,0011) of the segmentation object
+  segInstances.Columns,
+
+  # description:
+  # Pixel Spacing (0028,0030) as "row/column", from the Pixel Measures macro
+  # (PS3.3 C.7.6.16.2.1) - the Shared Functional Groups where the macro is
+  # there, and otherwise the Per-frame groups, but ONLY when every frame
+  # agrees. See issue 18 and geometrySource.
+  COALESCE(
+    ARRAY_TO_STRING(
+      ARRAY(
+        SELECT CAST(component AS STRING)
+        FROM UNNEST(
+          segInstances.sharedGroups.PixelMeasuresSequence[SAFE_OFFSET(0)]
+            .PixelSpacing) AS component),
+      '/'),
+    IF(frameGeometry.pixelSpacings = 1, frameGeometry.pixelSpacing, NULL))
+    AS PixelSpacing,
+
+  # description:
+  # Slice Thickness (0018,0050) from the Pixel Measures macro. NOMINAL - it is
+  # not the spacing between slices, and the two differ wherever slices overlap
+  # or leave gaps.
+  COALESCE(
+    CAST(segInstances.sharedGroups.PixelMeasuresSequence[SAFE_OFFSET(0)]
+      .SliceThickness AS STRING),
+    IF(frameGeometry.sliceThicknesses = 1, frameGeometry.sliceThickness, NULL))
+    AS SliceThickness,
+
+  # description:
+  # Spacing Between Slices (0018,0088) from the Pixel Measures macro. Type 1C
+  # there, so commonly absent, in which case issue 18 reports the slice spacing
+  # as NOT_COMPARED rather than falling back to the thickness.
+  COALESCE(
+    CAST(segInstances.sharedGroups.PixelMeasuresSequence[SAFE_OFFSET(0)]
+      .SpacingBetweenSlices AS STRING),
+    IF(frameGeometry.spacingsBetweenSlices = 1,
+       frameGeometry.spacingBetweenSlices, NULL))
+    AS SpacingBetweenSlices,
+
+  # description:
+  # Image Orientation (Patient) (0020,0037) as six "/"-joined direction
+  # cosines, from the Plane Orientation macro (PS3.3 C.7.6.16.2.4). Issue 18
+  # compares it with the segmented series' as an ANGLE, not as text.
+  COALESCE(
+    ARRAY_TO_STRING(
+      ARRAY(
+        SELECT CAST(component AS STRING)
+        FROM UNNEST(
+          segInstances.sharedGroups.PlaneOrientationSequence[SAFE_OFFSET(0)]
+            .ImageOrientationPatient) AS component),
+      '/'),
+    IF(frameGeometry.imageOrientationPatients = 1,
+       frameGeometry.imageOrientationPatient, NULL))
+    AS ImageOrientationPatient,
+
+  # description:
+  # Where the four attributes above were found: SHARED, PER_FRAME_UNIFORM,
+  # PER_FRAME_VARYING (frames disagree, so the object has no ONE grid and the
+  # values are NULL), or ABSENT. Weakest wins, since a macro may be shared for
+  # one attribute and per-frame for another.
+  CASE
+    WHEN segInstances.sharedGroups.PixelMeasuresSequence[SAFE_OFFSET(0)]
+           .PixelSpacing IS NOT NULL
+      OR segInstances.sharedGroups.PlaneOrientationSequence[SAFE_OFFSET(0)]
+           .ImageOrientationPatient IS NOT NULL
+      THEN 'SHARED'
+    WHEN GREATEST(
+           IFNULL(frameGeometry.pixelSpacings, 0),
+           IFNULL(frameGeometry.sliceThicknesses, 0),
+           IFNULL(frameGeometry.spacingsBetweenSlices, 0),
+           IFNULL(frameGeometry.imageOrientationPatients, 0)) > 1
+      THEN 'PER_FRAME_VARYING'
+    WHEN GREATEST(
+           IFNULL(frameGeometry.pixelSpacings, 0),
+           IFNULL(frameGeometry.sliceThicknesses, 0),
+           IFNULL(frameGeometry.spacingsBetweenSlices, 0),
+           IFNULL(frameGeometry.imageOrientationPatients, 0)) = 1
+      THEN 'PER_FRAME_UNIFORM'
+    ELSE 'ABSENT'
+  END AS geometrySource,
+
+  # description:
   # SeriesInstanceUID of the image series the segment was drawn on, from
   # ReferencedSeriesSequence (0008,1115)
   segInstances.referencedSeries.SeriesInstanceUID
@@ -449,6 +610,25 @@ SELECT
   segInstances.referencedSeriesCount,
 
   # description:
+  # How, if at all, the object says which images it segments. SERIES when
+  # ReferencedSeriesSequence names a SeriesInstanceUID - the only series-level
+  # link a SEG has, and the only one issues 17 and 18 can follow.
+  # INSTANCE_ONLY when it does not, but Source Image Sequence (0008,2112) or
+  # Referenced Image Sequence (0008,1140) names source SOP instances: the
+  # derivation IS recorded, and recovering the series from it needs an
+  # instance-level index. NONE when nothing connects the object to any image.
+  # DELETE the two ARRAY_LENGTHs in segInstances and hard-code 'NONE' here if
+  # the source schema lacks those sequences.
+  CASE
+    WHEN segInstances.referencedSeries.SeriesInstanceUID IS NOT NULL
+      THEN 'SERIES'
+    WHEN IFNULL(segInstances.sourceImageCount, 0) > 0
+      OR IFNULL(segInstances.referencedImageCount, 0) > 0
+      THEN 'INSTANCE_ONLY'
+    ELSE 'NONE'
+  END AS sourceImageReferenceLevel,
+
+  # description:
   # TRUE for the SegmentNumber 0 "Background" segment every labelmap object
   # carries. An artefact of the encoding, not a segmented finding - exclude it
   # from any count of what was segmented, and from the conformance check.
@@ -486,3 +666,6 @@ LEFT JOIN
   imageSeries
   ON imageSeries.SeriesInstanceUID
     = segInstances.referencedSeries.SeriesInstanceUID
+LEFT JOIN
+  frameGeometry
+  ON frameGeometry.SOPInstanceUID = segInstances.SOPInstanceUID

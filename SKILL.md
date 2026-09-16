@@ -1,9 +1,9 @@
 ---
 name: dicom-seg-review
-description: Audit DICOM Segmentation (SEG) objects for defects in how they are coded and encoded - anatomic, category and type codes whose meaning contradicts the code, ambiguous or retired codes, laterality, IOD conformance, empty frames, compression, display colours, algorithm provenance, segment numbering and frame-of-reference integrity - and produce a severity-ranked report plus a per-series triage CSV. Use when asked to review, QC, audit, validate or sanity-check DICOM segmentations reachable through BigQuery, a DICOMweb store or local files. SEG only, not RTSTRUCT.
+description: Audit DICOM Segmentation (SEG) objects for defects in how they are coded and encoded - anatomic, category and type codes whose meaning contradicts the code, ambiguous or retired codes, laterality, IOD conformance, empty frames, compression, display colours, algorithm provenance, segment numbering and frame-of-reference integrity - plus the geometry of each segmentation against the source series it references, resolved through IDC. Produces a severity-ranked report and a per-series triage CSV. Use when asked to review, QC, audit, validate or sanity-check DICOM segmentations reachable through BigQuery, a DICOMweb store or local files. SEG only, not RTSTRUCT.
 license: Apache-2.0
 metadata:
-  version: 1.4.0
+  version: 1.5.0
   skill-author: Andrey Fedorov, @fedorov
 ---
 
@@ -14,6 +14,11 @@ says "Large bowel" while its code denotes the liver, one code carrying five
 meanings, a left structure coded as the right one, an object whose `PixelData` is
 the wrong length, two organs a viewer will draw in one colour, a segmentation
 whose Frame of Reference is not its source image's.
+
+One check is not about defects at all. **Issue 18** compares each segmentation's
+grid with the grid of the series it segments, resolving that series through
+IDC, and records whether the source is available and whether the two are
+sampled the same way. Neither answer is a failure; both belong in the report.
 
 **The boundary is what the voxels mean, not the voxels themselves.** Nothing here
 judges whether the liver segmentation covers the liver. Two checks read pixel
@@ -56,9 +61,11 @@ on it. Prefer BigQuery where available: the checks are set-based.
 11 and 12 need the objects, so they run on files only; where the delivery is
 reachable as files anywhere, retrieve at least a sample and run them. Issue 17
 needs the referenced series resolved: BigQuery does it through `@@IMAGE_TABLE@@`,
-the other two through `--resolve-referenced`. In a triage CSV, a tag absent
-because a check never ran looks exactly like a tag absent because nothing was
-wrong.
+the other two through `--resolve-referenced`. Issue 18 needs the segmented
+series' own geometry, which is a fourth lookup - IDC, or a directory of the
+source images - and reaches the orientation only with `--probe` or `--files`.
+In a triage CSV, a tag absent because a check never ran looks exactly like a
+tag absent because nothing was wrong.
 
 ## Workflow
 
@@ -88,15 +95,22 @@ with. Install once with `pip install -r requirements.txt`; `seg_checks.py`,
    python scripts/dcmterm.py property  seg_attributes.csv -o findings/issue15_property_context_group.csv
    python scripts/dciodvfy_check.py --files <dir> -o findings/                # 9, files only
    python scripts/seg_encoding.py   --files <dir> -o findings/                # 11 12, files only
+   python scripts/seg_geometry.py seg_attributes.csv --probe orientation \
+       -o findings/issue18_geometry.csv                                       # 18, needs IDC
    ```
    Ambiguity (issue 2) first: fully computed, highest yield, and it hands you the
    shortlist for step 4. `dcmterm.py` checks codes against the code set DICOM's
    own context groups use, downloaded from
    [dcmterms](https://github.com/fedorov/dcmterms) and cached; `coverage` prints
-   how much of the batch it reached, and `property` decides issue 15. `dciodvfy`
-   validates **structure, not semantics**: a clean run says nothing about the
-   coding. All terminology checks judge the anatomic region, the property type
-   and the property category.
+   how much of the batch it reached, and `property` decides issue 15.
+   `seg_geometry.py` answers issue 18: whether IDC holds each segmented series,
+   and whether its grid is the segmentation's. `--probe orientation` costs one
+   ~16 KB ranged HTTPS GET per series and is what supplies the orientation - no
+   IDC index carries `ImageOrientationPatient`. Point it at `--files <the
+   source images>` instead wherever you have them.
+   `dciodvfy` validates **structure, not semantics**: a clean run says nothing
+   about the coding. All terminology checks judge the anatomic region, the
+   property type and the property category.
 
 4. **Look up every distinct code's fully specified name, and judge.**
    ```bash
@@ -115,7 +129,8 @@ with. Install once with `pip install -r requirements.txt`; `seg_checks.py`,
    python scripts/seg_checks.py seg_attributes.csv --outdir findings/ \
        --codes findings/codes.csv --review review.csv \
        --property findings/issue15_property_context_group.csv \
-       --iod findings/issue9_iod_validation.csv --encoding findings/encoding_per_object.csv
+       --iod findings/issue9_iod_validation.csv --encoding findings/encoding_per_object.csv \
+       --geometry findings/issue18_geometry.csv
    ```
    `seg_checks.py` prints which checks ran and which were skipped; the report
    repeats that. `references/reporting.md` gives the report structure and the
@@ -147,6 +162,7 @@ Numbers are stable so reports can cite them; the table is in severity order.
 | 11 | Medium / Low | Segment with no voxels; all-zero frames a BINARY object kept | Computed, files only |
 | 5 | Low | `SegmentedPropertyType` merely repeats the category | Computed |
 | 6 | Low | `SegmentsOverlap` absent (Type 3; conformant, but costly on multi-segment objects) | Computed |
+| 18 | Low | Segmented series absent, or sampled on a different grid from the segmentation. **Not a defect** | Computed, needs the segmented series |
 
 **Anatomic coding is almost always where the damage is** (issues 1, 2, 3, 8, 15).
 Budget the review accordingly. Issues 11 to 17 are cheap and mostly Medium or
@@ -199,6 +215,17 @@ catalogue. Read the catalogue before concluding anything about a batch.
   `INFORMATION_SCHEMA.COLUMN_FIELD_PATHS` first; the absence is itself a finding.
 - **Filter on `SOPClassUID`, not `Modality = 'SEG'`**, accepting both
   `1.2.840.10008.5.1.4.1.1.66.4` and `...66.7` (Labelmap).
+- **A different grid is not a defect, and "not compared" is not a match.** Issue
+  18 is Low throughout: PS3.3 A.51.1 constrains the Frame of Reference, not the
+  sampling, so a resampled or cropped segmentation is conformant. Report it as a
+  property of the delivery. And without `--probe` or `--files` the orientation -
+  the dimension most worth having - is never looked at, because no IDC index
+  carries `ImageOrientationPatient`.
+- **`ReferencedSeriesSequence` is the only series-level link a SEG has**, and a
+  batch that records its derivation per SOP instance has none: issues 17 and 18
+  are then both silent, and `sourceImageReferenceLevel` is what separates "the
+  link is there, per instance" from "there is no link at all". Neither is a
+  producer error; both are worth saying.
 - **Every finding needs a clickable example.** Build a viewer URL into the
   per-segment table from the start (`--viewer-url`, `@@VIEWER_BASE@@`).
 - **Cite every external authority by version**: the DICOM edition `dcmterm.py`

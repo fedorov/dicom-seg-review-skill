@@ -4,3 +4,6 @@ pydicom>=3.0            # seg_attributes.py --files, seg_encoding.py, dciodvfy_c
 pyarrow                 # dcmterm.py (any one of pyarrow, duckdb or pandas reads the Parquet)
 dicom3tools             # dciodvfy, for dciodvfy_check.py
 dicomweb-client>=0.59   # seg_attributes.py --dicomweb; add [gcp] and google-auth for Healthcare API stores
+idc-index>=0.12.0       # seg_geometry.py - the IDC lookup. 0.12 is the first with ct/mr/pt_index,
+                        # which carry Rows, Columns, PixelSpacing and SliceThickness; an older one
+                        # still answers "is the segmented series in IDC" and says so.

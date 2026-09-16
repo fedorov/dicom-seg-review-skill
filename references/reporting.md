@@ -228,6 +228,9 @@ COLOR_ABSENT               Low       issue 13
 ALGORITHM_UNIDENTIFIED     Low       issue 14
 TYPE_NOT_IN_CID            Low       issue 15 - needs dcmterm.py property
 CATEGORY_NOT_IN_CID        Low       issue 15 - needs dcmterm.py property
+GEOMETRY_DIFFERS           Low       issue 18 - needs seg_geometry.py
+SOURCE_NOT_IN_IDC          Low       issue 18 - needs seg_geometry.py
+NO_REFERENCED_SERIES       Low       issue 18 - needs seg_geometry.py
 CODE_AMBIGUOUS_ELSEWHERE   context   issue 2 — does NOT raise worstSeverity
 ```
 
@@ -243,6 +246,8 @@ with three classes of exception, each a check that a given path may not have run
   roll-up never emits them.
 - The two issue 17 tags need the referenced series resolved: always on BigQuery,
   only with `--resolve-referenced` on the other two paths.
+- The three issue 18 tags need `seg_geometry.py` and `--geometry`. They are the only
+  tags in this list that are **not** defects: see below.
 
 A triage list built without one of these is **silent** about it, not clean.
 `seg_checks.py` prints which checks ran; repeat that in the report, because a tag
@@ -253,6 +258,28 @@ because nothing was wrong.
 while the script offers near-match candidates (`cosmeticCandidate` in
 `issue2_ambiguous_code.csv`) for you to confirm. Confirm them before quoting the Low
 count as final.
+
+### The three issue 18 tags are not defects
+
+`GEOMETRY_DIFFERS`, `SOURCE_NOT_IN_IDC` and `NO_REFERENCED_SERIES` are Low and stay
+Low. A segmentation sampled on a different grid from its source is conformant — PS3.3
+A.51.1 constrains the Frame of Reference, not the sampling — and whether IDC holds the
+segmented series is a fact about the delivery's provenance, not about the object. They
+are in the triage list so that whoever picks up a series knows, not so that the list
+ranks on them.
+
+Give issue 18 **its own section** in the report, structured as what was compared rather
+than what is wrong:
+
+- how the segmented series was resolved, for how many series, and by which resolver —
+  `--files`, the IDC index, or `--probe`;
+- the proportion of referenced series IDC holds. State this **before** any list: "3 of
+  412 are not in IDC" is a finding, "412 of 412 are not" says these are not IDC images;
+- how many objects name no segmented series at all, split by `sourceImageReferenceLevel`
+  — `INSTANCE_ONLY` is conformant and is not the same as `NONE`;
+- a table of the grid mismatches, both grids side by side;
+- **which dimensions were never compared.** Without `--probe` or `--files` the
+  orientation is one of them, on every row.
 
 ### `CODE_AMBIGUOUS_ELSEWHERE` is not a work queue
 

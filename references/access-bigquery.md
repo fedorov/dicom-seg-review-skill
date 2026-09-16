@@ -160,6 +160,7 @@ issue 13. Whichever you use, name it in the report — it is a choice, not a fac
 | `15_algorithm_identification.sql` | issue 14 | computed |
 | `16_segment_numbers.sql` | issue 16 | computed |
 | `17_frame_of_reference.sql` | issue 17 | computed |
+| `18_geometry.sql` | issue 18 | computed |
 
 File numbers are **not** issue numbers — they are the order the files were added, and
 issues are numbered separately so that a report can cite an issue for good. The
@@ -279,6 +280,30 @@ or a WADO-RS retrieval of a sample — run `scripts/dciodvfy_check.py` and
 `scripts/seg_encoding.py` there and fold the results in with `seg_checks.py --iod`
 and `--encoding`. Issue 10, the retired coding scheme designators dciodvfy also
 reports, *is* computable here: `sql/13_retired_coding_scheme.sql`.
+
+**Issue 18 is at its strongest here.** `sql/18_geometry.sql` reads the per-segment
+view and joins `@@IMAGE_TABLE@@` for the segmented series' grid; point that at
+`bigquery-public-data.idc_current.dicom_all` and "is the segmented series available in
+IDC" *is* the join. `dicom_all` carries `ImageOrientationPatient` per instance, so the
+orientation comparison — the one `seg_geometry.py` needs `--probe` or `--files` for —
+comes for free. Substitute the same `@@SPACING_TOLERANCE@@` the script was given, or
+the two will disagree about which series are tagged.
+
+The one comparison the SQL cannot make is the **measured** slice spacing: that means
+projecting every instance's `ImagePositionPatient` onto the slice normal and taking the
+median gap, which is trigonometry over arrays for little gain here. `sql/18` uses the
+source's declared `SpacingBetweenSlices` where there is one and is silent otherwise.
+Run `seg_geometry.py --probe full` on a sample if the spacing matters.
+
+`sql/01` gains two things for issue 18, and both are worth checking before deploying.
+The geometry columns read the Pixel Measures and Plane Orientation macros from the
+**Shared** Functional Groups, falling back to a `frameGeometry` CTE that unnests
+`PerFrameFunctionalGroupsSequence` — delete that CTE if the scan cost is not worth it,
+and `geometrySource` will say which objects went unexamined. And
+`sourceImageReferenceLevel` reads the two *top-level* instance-reference sequences
+only, so an object whose only link is the per-frame Derivation Image group reads `NONE`
+here and `INSTANCE_ONLY` from `seg_attributes.py`. Extract with the script where that
+distinction matters.
 
 Issues 13 and 14 are fully available: `sql/14_recommended_color.sql` and
 `sql/15_algorithm_identification.sql`, both reading the per-segment view. The one

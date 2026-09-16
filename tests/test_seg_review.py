@@ -31,6 +31,7 @@ import lookup_codes  # noqa: E402
 import seg_attributes  # noqa: E402
 import seg_checks  # noqa: E402
 import seg_encoding  # noqa: E402
+import seg_geometry  # noqa: E402
 
 
 def code(value, meaning, scheme="SCT"):
@@ -1356,6 +1357,251 @@ class TestFrameOfReference(unittest.TestCase):
             ds, referenced={"R1": {"FrameOfReferenceUID": "F2"}})[0]
         self.assertEqual(present["referencedSeriesFound"], "True")
         self.assertEqual(present["referencedFrameOfReferenceUID"], "F2")
+
+
+class TestGeometryExtraction(unittest.TestCase):
+    """Issue 18, the segmentation's half. Pixel Measures and Plane Orientation
+    are legal in either functional groups macro, and an object whose frames
+    disagree has no one grid."""
+
+    def measures(self, spacing=(1.0, 1.0), thickness=2.0, between=2.0):
+        item = Dataset()
+        item.PixelSpacing = list(spacing)
+        item.SliceThickness = thickness
+        item.SpacingBetweenSlices = between
+        return item
+
+    def orientation(self, cosines=(1, 0, 0, 0, 1, 0)):
+        item = Dataset()
+        item.ImageOrientationPatient = list(cosines)
+        return item
+
+    def group(self, **kwargs):
+        item = Dataset()
+        if "measures" in kwargs:
+            item.PixelMeasuresSequence = [kwargs["measures"]]
+        if "orientation" in kwargs:
+            item.PlaneOrientationSequence = [kwargs["orientation"]]
+        return item
+
+    def seg(self, shared=None, frames=None, rows=64, columns=64):
+        ds = instance([segment(1, "A")])
+        ds.Rows = rows
+        ds.Columns = columns
+        if shared is not None:
+            ds.SharedFunctionalGroupsSequence = [shared]
+        if frames is not None:
+            ds.PerFrameFunctionalGroupsSequence = frames
+        return ds
+
+    def test_shared_groups_are_read(self):
+        ds = self.seg(self.group(measures=self.measures(),
+                                 orientation=self.orientation()))
+        [row] = seg_attributes.extract_instance(ds)
+        self.assertEqual(row["geometrySource"], "SHARED")
+        self.assertEqual(row["Rows"], "64")
+        self.assertEqual(row["PixelSpacing"], "1.0/1.0")
+        self.assertEqual(row["SpacingBetweenSlices"], "2.0")
+        self.assertEqual(row["ImageOrientationPatient"],
+                         "1.0/0.0/0.0/0.0/1.0/0.0")
+
+    def test_per_frame_groups_are_the_fallback(self):
+        frame = self.group(measures=self.measures(), orientation=self.orientation())
+        [row] = seg_attributes.extract_instance(self.seg(frames=[frame, frame]))
+        self.assertEqual(row["geometrySource"], "PER_FRAME_UNIFORM")
+        self.assertEqual(row["PixelSpacing"], "1.0/1.0")
+
+    def test_frames_that_disagree_leave_the_value_empty(self):
+        a = self.group(measures=self.measures(spacing=(1.0, 1.0)))
+        b = self.group(measures=self.measures(spacing=(2.0, 2.0)))
+        [row] = seg_attributes.extract_instance(self.seg(frames=[a, b]))
+        self.assertEqual(row["geometrySource"], "PER_FRAME_VARYING")
+        self.assertEqual(row["PixelSpacing"], "")
+
+    def test_macros_may_be_split_between_the_two(self):
+        """Shared Pixel Measures, per-frame Plane Orientation. Weakest wins."""
+        frame = self.group(orientation=self.orientation())
+        ds = self.seg(self.group(measures=self.measures()), frames=[frame, frame])
+        [row] = seg_attributes.extract_instance(ds)
+        self.assertEqual(row["PixelSpacing"], "1.0/1.0")
+        self.assertEqual(row["ImageOrientationPatient"],
+                         "1.0/0.0/0.0/0.0/1.0/0.0")
+        self.assertEqual(row["geometrySource"], "PER_FRAME_UNIFORM")
+
+    def test_no_functional_groups_is_absent_not_a_crash(self):
+        [row] = seg_attributes.extract_instance(self.seg())
+        self.assertEqual(row["geometrySource"], "ABSENT")
+        self.assertEqual(row["ImageOrientationPatient"], "")
+
+
+class TestSourceImageReferenceLevel(unittest.TestCase):
+    """Issue 18. ReferencedSeriesSequence is the only SERIES-level link a SEG
+    has; the instance-level ones are conformant and unfollowable."""
+
+    def level(self, ds):
+        return seg_attributes.extract_instance(ds)[0]["sourceImageReferenceLevel"]
+
+    def test_referenced_series_is_the_series_level_link(self):
+        ds = instance([segment(1, "A")])
+        ref = Dataset()
+        ref.SeriesInstanceUID = "R1"
+        ds.ReferencedSeriesSequence = [ref]
+        self.assertEqual(self.level(ds), "SERIES")
+
+    def test_source_image_sequence_is_instance_only(self):
+        ds = instance([segment(1, "A")])
+        source = Dataset()
+        source.ReferencedSOPInstanceUID = "1.2.3"
+        ds.SourceImageSequence = [source]
+        self.assertEqual(self.level(ds), "INSTANCE_ONLY")
+
+    def test_per_frame_derivation_is_instance_only(self):
+        ds = instance([segment(1, "A")])
+        source = Dataset()
+        source.ReferencedSOPInstanceUID = "1.2.3"
+        derivation = Dataset()
+        derivation.SourceImageSequence = [source]
+        frame = Dataset()
+        frame.DerivationImageSequence = [derivation]
+        ds.PerFrameFunctionalGroupsSequence = [frame]
+        self.assertEqual(self.level(ds), "INSTANCE_ONLY")
+
+    def test_nothing_at_all_is_none(self):
+        self.assertEqual(self.level(instance([segment(1, "A")])), "NONE")
+
+
+class TestGeometryComparison(unittest.TestCase):
+    """Issue 18's comparison. Nothing here is a conformance verdict, and
+    "not compared" must never read as a match."""
+
+    SEG = {
+        "Rows": "64", "Columns": "64",
+        "PixelSpacing": "1.0/1.0", "SliceThickness": "2.0",
+        "SpacingBetweenSlices": "2.0",
+        "ImageOrientationPatient": "1/0/0/0/1/0",
+        "geometrySource": "SHARED",
+        "sourceImageReferenceLevel": "SERIES",
+    }
+    SOURCE = {
+        "Rows": 64, "Columns": 64, "PixelSpacing": [1.0, 1.0],
+        "SliceThickness": 2.0, "SpacingBetweenSlices": 2.0,
+        "ImageOrientationPatient": [1, 0, 0, 0, 1, 0],
+    }
+
+    def compare(self, seg=None, source=None):
+        return seg_geometry.compare(
+            seg={**self.SEG, **(seg or {})},
+            source=None if source is False else {**self.SOURCE, **(source or {})},
+            resolved_by="local_files", in_idc="True",
+            spacing_tolerance=1e-3, orientation_tolerance=0.1)
+
+    def observations(self, **kwargs):
+        return set(self.compare(**kwargs)["geometryObservation"].split("; "))
+
+    def test_identical_grids_match(self):
+        self.assertEqual(self.observations(), {"GEOMETRY_MATCHES"})
+
+    def test_grid_size_difference_is_reported(self):
+        self.assertIn("GRID_SIZE_DIFFERS", self.observations(source={"Rows": 128}))
+
+    def test_pixel_spacing_difference_is_reported(self):
+        self.assertIn("PIXEL_SPACING_DIFFERS",
+                      self.observations(source={"PixelSpacing": [0.5, 0.5]}))
+
+    def test_ds_rounding_is_not_a_mismatch(self):
+        """7.031003e-01 against 0.7031 is one spacing written twice. An exact
+        comparison would report a batch of false mismatches."""
+        observations = self.observations(
+            seg={"PixelSpacing": "7.031003e-01/7.031003e-01"},
+            source={"PixelSpacing": [0.7031, 0.7031]})
+        self.assertNotIn("PIXEL_SPACING_DIFFERS", observations)
+
+    def test_orientation_is_compared_as_an_angle(self):
+        observations = self.observations(
+            seg={"ImageOrientationPatient":
+                 "1.000000e+000/-2.038648e-010/0/0/1/0"})
+        self.assertNotIn("ORIENTATION_DIFFERS", observations)
+
+    def test_in_plane_rotation_is_caught(self):
+        """A slice normal alone would miss this: same plane, different axes."""
+        observations = self.observations(
+            source={"ImageOrientationPatient": [0, 1, 0, -1, 0, 0]})
+        self.assertIn("ORIENTATION_DIFFERS", observations)
+
+    def test_absent_source_orientation_is_not_a_match(self):
+        observations = self.observations(source={"ImageOrientationPatient": []})
+        self.assertIn("ORIENTATION_NOT_COMPARED", observations)
+        self.assertIn("GEOMETRY_MATCHES_PARTIAL", observations)
+        self.assertNotIn("GEOMETRY_MATCHES", observations)
+
+    def test_slice_thickness_does_not_stand_in_for_spacing(self):
+        observations = self.observations(source={"SpacingBetweenSlices": None})
+        self.assertIn("SLICE_SPACING_NOT_COMPARED", observations)
+        self.assertNotIn("SLICE_SPACING_DIFFERS", observations)
+
+    def test_unresolved_source_is_reported_not_passed(self):
+        finding = seg_geometry.compare(
+            seg=self.SEG, source=None, resolved_by="", in_idc="False",
+            spacing_tolerance=1e-3, orientation_tolerance=0.1)
+        self.assertEqual(finding["geometryObservation"], "SOURCE_NOT_IN_IDC")
+
+    def test_per_frame_varying_segmentation_has_no_grid(self):
+        observations = self.observations(
+            seg={"geometrySource": "PER_FRAME_VARYING", "PixelSpacing": "",
+                 "ImageOrientationPatient": "", "SpacingBetweenSlices": "",
+                 "SliceThickness": ""})
+        self.assertIn("SEG_GEOMETRY_PER_FRAME", observations)
+
+    def test_only_differences_become_triage_tags(self):
+        """The NOT_COMPARED observations must raise nothing."""
+        for observation in ("ORIENTATION_NOT_COMPARED", "GEOMETRY_MATCHES",
+                            "GEOMETRY_MATCHES_PARTIAL",
+                            "SOURCE_GEOMETRY_UNAVAILABLE"):
+            self.assertNotIn(observation, seg_geometry.TAGS)
+        self.assertEqual(seg_geometry.TAGS["GRID_SIZE_DIFFERS"],
+                         "GEOMETRY_DIFFERS")
+
+    def test_every_observation_has_a_place_in_the_order(self):
+        self.assertEqual(
+            set(seg_geometry.TAGS) - set(seg_geometry.OBSERVATION_ORDER), set())
+
+    def test_tags_reach_the_series_at_low(self):
+        rows = rows_for([instance([segment(1, "A")])])
+        geometry = {rows[0]["SeriesInstanceUID"]: Counter({"GEOMETRY_DIFFERS": 1})}
+        [out] = seg_checks.triage(rows, {}, set(), {}, {}, [], geometry=geometry)
+        self.assertIn("GEOMETRY_DIFFERS", out["issues"])
+        self.assertEqual(out["worstSeverity"], "Low")
+
+
+class TestSliceSpacingMeasurement(unittest.TestCase):
+    """Issue 18. The spacing is measured from the positions, because the order
+    instances arrive in is not the order they are stacked in."""
+
+    AXIAL = [1, 0, 0, 0, 1, 0]
+
+    def test_shuffled_positions_still_give_the_spacing(self):
+        positions = [[0, 0, z] for z in (6.0, 0.0, 4.0, 2.0)]
+        spacing, regular = seg_geometry.slice_spacing(self.AXIAL, positions)
+        self.assertAlmostEqual(spacing, 2.0)
+        self.assertTrue(regular)
+
+    def test_a_gap_makes_the_series_irregular(self):
+        positions = [[0, 0, z] for z in (0.0, 2.0, 4.0, 10.0)]
+        _, regular = seg_geometry.slice_spacing(self.AXIAL, positions)
+        self.assertFalse(regular)
+
+    def test_oblique_orientation_projects_onto_its_own_normal(self):
+        import math
+        half = math.sqrt(0.5)
+        orientation = [1, 0, 0, 0, half, half]
+        positions = [[0, -half * d, half * d] for d in (0.0, 3.0, 6.0)]
+        spacing, regular = seg_geometry.slice_spacing(orientation, positions)
+        self.assertAlmostEqual(spacing, 3.0)
+        self.assertTrue(regular)
+
+    def test_one_slice_cannot_be_measured(self):
+        self.assertEqual(
+            seg_geometry.slice_spacing(self.AXIAL, [[0, 0, 0]]), (None, None))
 
 
 class TestPropertyContextGroups(unittest.TestCase):
