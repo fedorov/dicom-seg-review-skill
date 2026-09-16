@@ -15,8 +15,11 @@ copied verbatim.
 """
 
 import csv
+import json
 import sys
 import unittest
+import unittest.mock
+import urllib.error
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -1756,6 +1759,167 @@ class TestMultiColumnCollection(unittest.TestCase):
         row = {r["CodeValue"]: r for r in dcmterm.coverage(codes, DCM, cids)}["10200004"]
         self.assertEqual(row["codeSequences"], "AnatomicRegion; SegmentedPropertyType")
         self.assertEqual(row["cids"], "7154")
+
+
+class TestTerminologyServers(unittest.TestCase):
+    """tx.fhir.org and OLS4 answer different questions, and lookup_codes.py must
+    not let the fast one speak for the slow one.
+
+    OLS4 serves SNOMED CT International as the inferred OWL, which carries ACTIVE
+    concepts only, so a code it cannot find is usually retired - the one thing a
+    reader would read "not found" as ruling out. No network here: the OLS4 payload
+    is a real response for 110634007, trimmed to the fields the parser reads.
+    """
+
+    OLS4_HIT = {
+        "_embedded": {"terms": [{
+            "iri": "http://snomed.info/id/110634007",
+            "label": "Right uterine adnexa",
+            "annotation": {
+                "alternative label": ["Structure of right uterine adnexa"],
+                "preferred label": ["Right uterine adnexa"],
+            },
+            "synonyms": [],
+            "is_obsolete": False,
+            "obo_id": "SNOMED:110634007",
+        }]}
+    }
+
+    def fake_urlopen(self, payload, status=None):
+        """urlopen returning `payload`, or raising HTTPError(status)."""
+        class Response:
+            def __enter__(inner):
+                return inner
+
+            def __exit__(inner, *exc):
+                return False
+
+            def read(inner):
+                return json.dumps(payload).encode()
+
+        def opener(url, timeout=None):
+            if status is not None:
+                raise urllib.error.HTTPError(url, status, "no", {}, None)
+            return Response()
+
+        return opener
+
+    def patch(self, name, value):
+        original = getattr(lookup_codes, name)
+        setattr(lookup_codes, name, value)
+        self.addCleanup(setattr, lookup_codes, name, original)
+
+    def test_ols4_returns_every_term_it_carries(self):
+        """The FSN stem is among OLS4's terms but nothing marks which one it is -
+        its `label` here is the preferred term, not the FSN."""
+        with unittest.mock.patch.object(
+                lookup_codes.urllib.request, "urlopen",
+                self.fake_urlopen(self.OLS4_HIT)):
+            found, label, terms = lookup_codes.lookup_ols4("110634007")
+        self.assertTrue(found)
+        self.assertEqual(label, "Right uterine adnexa")
+        self.assertEqual(terms,
+                         ("Right uterine adnexa", "Structure of right uterine adnexa"))
+
+    def test_ols4_404_is_not_found_rather_than_an_error(self):
+        with unittest.mock.patch.object(
+                lookup_codes.urllib.request, "urlopen",
+                self.fake_urlopen(None, status=404)):
+            self.assertEqual(lookup_codes.lookup_ols4("99999999"), (False, "", ()))
+
+    def test_ols4_miss_is_unresolved_never_missing(self):
+        """The distinction the whole second source turns on: OLS4 holds no retired
+        concept, so its silence is not evidence the code does not exist."""
+        self.patch("lookup_ols4", lambda code, timeout=30: (False, "", ()))
+        result = lookup_codes.resolve_ols4(["125074003"], workers=1)["125074003"]
+        self.assertEqual(result["found"], "UNRESOLVED")
+        self.assertEqual(result["active"], "")
+        self.assertIn("retired", result["note"])
+
+    def test_ols4_never_claims_a_code_is_active(self):
+        self.patch("lookup_ols4",
+                   lambda code, timeout=30: (True, "Liver structure", ("Liver structure",)))
+        result = lookup_codes.resolve_ols4(["10200004"], workers=1)["10200004"]
+        self.assertEqual(result["found"], "True")
+        self.assertEqual(result["active"], "")
+        self.assertEqual(result["source"], lookup_codes.OLS4_NAME)
+
+    def test_fhir_separates_retired_from_nonexistent(self):
+        answers = {
+            "125074003": (True, "Hereford cattle superbreed (organism)", False),
+            "99999999": (False, "", True),
+            "10200004": (True, "Liver structure (body structure)", True),
+        }
+        self.patch("lookup_fhir",
+                   lambda code, system=None, timeout=15: answers[code])
+        results, fallback = lookup_codes.resolve_fhir(list(answers), delay=0)
+        self.assertIsNone(fallback)
+        self.assertEqual(results["125074003"]["status"], "retired")
+        self.assertEqual(results["125074003"]["active"], "False")
+        self.assertEqual(results["99999999"]["status"], "missing")
+        # A code that does not exist has no activity status to report.
+        self.assertEqual(results["99999999"]["active"], "")
+        self.assertEqual(results["10200004"]["status"], "ok")
+
+    def test_fhir_outage_finishes_on_ols4_and_says_so(self):
+        """An outage should cost the `active` column, not the whole review - and
+        every row it costs must name OLS4 as its source."""
+        def down(code, system=None, timeout=15):
+            raise urllib.error.URLError("connection refused")
+
+        self.patch("lookup_fhir", down)
+        self.patch("lookup_ols4",
+                   lambda code, timeout=30: (True, f"term {code}", (f"term {code}",)))
+        self.patch("time", _NoSleep())
+        codes = [str(n) for n in range(6)]
+        results, answered = lookup_codes.resolve_fhir(codes, delay=0)
+        self.assertEqual(answered, 0)
+        self.assertEqual(len(results), len(codes))
+        self.assertEqual({r["source"] for r in results.values()},
+                         {lookup_codes.OLS4_NAME})
+        self.assertEqual({r["active"] for r in results.values()}, {""})
+
+    def test_fallback_counts_what_tx_actually_answered(self):
+        """The number in the warning is codes answered, not codes attempted - a
+        reader uses it to decide how much of the run to repeat."""
+        answers = {"a": (True, "A (body structure)", True)}
+
+        def flaky(code, system=None, timeout=15):
+            if code in answers:
+                return answers[code]
+            raise urllib.error.URLError("connection refused")
+
+        self.patch("lookup_fhir", flaky)
+        self.patch("lookup_ols4", lambda code, timeout=30: (True, code, (code,)))
+        self.patch("time", _NoSleep())
+        results, answered = lookup_codes.resolve_fhir(
+            ["x", "a", "y", "z", "w"], delay=0)
+        self.assertEqual(answered, 1)
+        self.assertEqual(results["a"]["source"], lookup_codes.FHIR_NAME)
+        # The isolated early failure is re-resolved, not left as an ERROR row.
+        self.assertEqual(results["x"]["source"], lookup_codes.OLS4_NAME)
+        self.assertEqual(results["x"]["found"], "True")
+
+    def test_entire_flavour_reads_every_term(self):
+        """On tx.fhir.org the term set is the one FSN; on OLS4 an "Entire X" can
+        hide behind a synonymous label, so the test is over all of them."""
+        self.assertTrue(lookup_codes.is_entire_flavour(("Entire colon (body structure)",)))
+        self.assertTrue(lookup_codes.is_entire_flavour(("Colon", "Entire colon")))
+        self.assertFalse(lookup_codes.is_entire_flavour(("Colon structure", "Colon")))
+        self.assertFalse(lookup_codes.is_entire_flavour(()))
+
+    def test_source_column_is_written_for_every_resolved_row(self):
+        """`reviewSource` in the review table has to be defensible per code, which
+        means codes.csv has to record which server answered."""
+        self.assertIn("source", lookup_codes.COLUMNS)
+        self.assertIn("terms", lookup_codes.COLUMNS)
+
+
+class _NoSleep:
+    """Stands in for the `time` module so the outage test does not wait."""
+
+    def sleep(self, seconds):
+        pass
 
 
 if __name__ == "__main__":

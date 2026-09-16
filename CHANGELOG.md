@@ -1,5 +1,48 @@
 # Changelog
 
+## 1.6.0 — 2026-09-16
+
+A second SNOMED server, added for speed and for survivability — and deliberately
+not trusted with the two questions it cannot answer.
+
+- **EBI OLS4 as an optional second server** behind `lookup_codes.py --server`:
+  `fhir` (the default, unchanged), `ols4`, and `hybrid`. `hybrid` screens the whole
+  batch against [OLS4](https://www.ebi.ac.uk/ols4) concurrently — 120 codes in under
+  7 seconds against 36 for the polite serial crawl — then sends everything OLS4 could
+  not resolve to `tx.fhir.org`. Public and unauthenticated, like every other authority
+  here.
+- **The residue is the point, not a leftover.** OLS4 loads `snomed-inferred.owl`,
+  which carries **active concepts only**: of 400 random SCT codes from dcmterms it
+  resolved 257, and all 40 of the misses sampled are `inactive` on `tx.fhir.org`
+  (`125074003` "Hereford cattle superbreed", `442595001` "Right ventral-left dorsal
+  oblique projection"). So the codes OLS4 cannot answer are precisely the
+  retired-and-nonexistent set — the findings — and in `hybrid` they are exactly the
+  ones the authoritative server answers.
+- **OLS4 is never allowed to say "missing" or "active".** A miss is reported as
+  `UNRESOLVED`, not `MISSING`, because it cannot tell a retired code from one that
+  never existed; and an `ols4` row leaves `active` empty rather than claiming a
+  concept is current. An `UNRESOLVED` code is **unjudged** — the run says so, and says
+  to re-run it with `--server fhir` before the report calls it anything.
+- **Its label is not the FSN, so the FSN checks say which term they got.** Of the 257
+  codes OLS4 resolved, `label` was the FSN minus its semantic tag for 198, the full
+  FSN for 22, and a synonym or preferred term for 37 — `241620005` comes back as
+  "Cardiac MRI", not "Magnetic resonance imaging of heart (procedure)". Two new
+  columns in `codes.csv`: **`source`**, the server that answered each row, and
+  **`terms`**, every term OLS4 carries for the concept. `isEntireFlavour` now tests
+  the whole term set, so an "Entire X" cannot hide behind a synonymous label; on a
+  `tx.fhir.org` row the set is the one FSN and the test is unchanged.
+- **An outage costs the `active` column, not the review.** After three consecutive
+  `tx.fhir.org` failures the run finishes on OLS4, marks those rows `source=ols4`, and
+  prints what that means for them.
+- **`active` is now empty for a code that does not exist.** It used to read `True`,
+  which is how a code that exists and is current reads.
+- `reviewSource` in the review table takes `ols4` as a fourth value, and the OLS4
+  SNOMED release IRI (`http://snomed.info/sct/900000000000207008/version/20251017`,
+  reloaded nightly) is printed on every run that used it — cite it as you cite the
+  DICOM edition. OLS4 hosts no `DCM` ontology, so the codes neither source can reach
+  are the same set as before.
+- Nine new tests, 186 in all.
+
 ## 1.5.0 — 2026-09-16
 
 One new check, and it is the first one here that does not look for a defect.

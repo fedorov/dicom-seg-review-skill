@@ -91,14 +91,14 @@ scripts/
   seg_encoding.py                    empty frames + compression, from the objects
   seg_geometry.py                    the segmentation's grid against the segmented series'
   dcmterm.py                         codes against DICOM's own code set and context groups
-  lookup_codes.py                    resolve codes to fully specified names
+  lookup_codes.py                    resolve codes to fully specified names (tx.fhir.org | OLS4)
   cielab.py                          DICOM's CIELab: parse, compare, draw a swatch
   make_fixture.py                    a synthetic five-file delivery with known defects
   sql/                               the same checks as BigQuery templates, 01–18
 templates/
   review.csv                         the curated verdict table's header, with two examples
 tests/
-  test_seg_review.py                 177 tests over the extraction and check logic
+  test_seg_review.py                 186 tests over the extraction and check logic
 requirements.txt                     every optional dependency
 ```
 
@@ -113,7 +113,7 @@ requirements.txt                     every optional dependency
 | `seg_attributes.py --dicomweb` | `dicomweb-client>=0.59`, plus `[gcp]` and `google-auth` for Healthcare API stores |
 | `seg_geometry.py` | `idc-index>=0.12.0` for the IDC lookup; `pydicom>=3.0` for `--files` and `--probe`. Neither is needed to read an existing result |
 | `scripts/sql/` | the `bq` CLI |
-| `lookup_codes.py` | network access to `tx.fhir.org` (public, no auth) |
+| `lookup_codes.py` | network access to `tx.fhir.org`, and to `www.ebi.ac.uk` for `--server ols4` / `hybrid` (both public, no auth) |
 | `dcmterm.py` | one download from [fedorov/dcmterms](https://github.com/fedorov/dcmterms) (public, ~1 MB, cached) |
 
 `seg_encoding.py` needs no pixel-data codec and no numpy: frames are scanned as bytes.
@@ -128,12 +128,15 @@ or one build, on one day:
 |---|---|
 | [**dcmterms**](https://github.com/fedorov/dcmterms) | every coded entry in DICOM PS3.16's context groups, and how the groups include one another, as Parquet — what DICOM *expects* |
 | [**tx.fhir.org**](https://tx.fhir.org) | all of SNOMED CT — fully specified names, retired concepts, everything dcmterms does not cover |
+| [**EBI OLS4**](https://www.ebi.ac.uk/ols4) | the same SNOMED lookup, concurrent and fast, as the optional second server. Its release holds **active concepts only** and its label is not reliably the FSN, so it screens a batch but settles nothing: `--server hybrid` sends everything it cannot resolve to `tx.fhir.org`. Cite the version IRI it prints |
 | [**dicom3tools**](https://github.com/ImagingDataCommons/dicom3tools-python-distributions) | `dciodvfy`, David Clunie's IOD validator — structure against PS3.3. It checks no context group, so it says nothing about whether the coding is right |
 | [**IDC**](https://imaging.datacommons.cancer.gov) | via [idc-index](https://github.com/ImagingDataCommons/idc-index): whether the segmented series is public, and its grid. No credentials; `--probe` reads instance headers from the open bucket by ranged HTTPS GET. Cite the IDC version `get_idc_version()` reports |
 
 The first two are the terminology pair, and neither alone is enough: a review that
 joins only dcmterms **silently passes everything it does not cover**. See "The coverage
-trap" in `SKILL.md`. The third and fourth are orthogonal to both and to each other.
+trap" in `SKILL.md`. OLS4 is an accelerator for the second, not a third opinion — see
+"A second SNOMED server" in `references/terminology.md`. dicom3tools and IDC are
+orthogonal to all of them and to each other.
 
 ## Verification
 
@@ -142,11 +145,12 @@ pip install pydicom          # the only thing the suite needs
 python tests/test_seg_review.py
 ```
 
-177 tests over extraction, the check logic, colour, algorithm identification, empty
+186 tests over extraction, the check logic, colour, algorithm identification, empty
 frames, the terminology comparison, context-group membership, segment numbering,
 frame-of-reference integrity, geometry against the segmented series, the
-review-table contract, the `dciodvfy -new`
-output parser and the guard against a dciodvfy build that rejects its flags. Terminology tests run against a stub table and validator tests against
+review-table contract, what each SNOMED server may and may not assert, the
+`dciodvfy -new`
+output parser and the guard against a dciodvfy build that rejects its flags. Terminology tests run against a stub table, the OLS4 tests against a captured response, and validator tests against
 captured output, so the suite needs neither network, nor dicom3tools, nor fixture
 files.
 

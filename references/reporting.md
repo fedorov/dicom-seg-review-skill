@@ -32,6 +32,12 @@ segments, series and patients. State the scope explicitly — "SEG only; RTSTRUC
 problems are in <other document>" — so absence of a finding is not read as absence of
 a problem.
 
+The same sentence is where any **unjudged** codes belong. A code `codes.csv` marks
+`UNRESOLVED` was looked up on OLS4 alone, whose release holds active concepts only, so
+neither "this code is retired" nor "this code does not exist" has been decided for it —
+say how many there are and that the clean bill does not extend to them, exactly as for
+the codes dcmterms does not cover.
+
 ### Summary table, in severity order
 
 | # | Severity | Problem | Scale | Query |
@@ -107,11 +113,13 @@ The exact commands, and — importantly — **which parts will not follow a new 
 > re-checking what they surface. Every other query is fully computed and will follow
 > the data.
 
-**Name every external authority by version**, in the same section — the two
-terminology sources and the IOD validator:
+**Name every external authority by version**, in the same section — the terminology
+sources, each SNOMED server that answered, and the IOD validator:
 
 > Codes were checked against DICOM 2026c (dcmterms, extracted 2026-07-02) and, for
-> those DICOM does not carry, against SNOMED CT via `tx.fhir.org` on 2026-09-15.
+> those DICOM does not carry, against SNOMED CT via `tx.fhir.org` on 2026-09-15 —
+> and, where `codes.csv` says `source=ols4`, against SNOMED CT International
+> `http://snomed.info/sct/900000000000207008/version/20251017` as EBI OLS4 served it.
 > Objects were validated against the IOD with dciodvfy (dicom3tools 20260901).
 > Colours within an object were compared in CIELab, calling two confusable below
 > 10 dE*ab (`--color-delta-e`).

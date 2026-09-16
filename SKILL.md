@@ -3,7 +3,7 @@ name: dicom-seg-review
 description: Audit DICOM Segmentation (SEG) objects for defects in how they are coded and encoded - anatomic, category and type codes whose meaning contradicts the code, ambiguous or retired codes, laterality, IOD conformance, empty frames, compression, display colours, algorithm provenance, segment numbering and frame-of-reference integrity - plus the geometry of each segmentation against the source series it references, resolved through IDC. Produces a severity-ranked report and a per-series triage CSV. Use when asked to review, QC, audit, validate or sanity-check DICOM segmentations reachable through BigQuery, a DICOMweb store or local files. SEG only, not RTSTRUCT.
 license: Apache-2.0
 metadata:
-  version: 1.5.0
+  version: 1.6.0
   skill-author: Andrey Fedorov, @fedorov
 ---
 
@@ -115,14 +115,20 @@ with. Install once with `pip install -r requirements.txt`; `seg_checks.py`,
 4. **Look up every distinct code's fully specified name, and judge.**
    ```bash
    python scripts/lookup_codes.py seg_attributes.csv -o findings/codes.csv          # tx.fhir.org, all three sequences
+   python scripts/lookup_codes.py seg_attributes.csv --server hybrid -o findings/codes.csv   # EBI OLS4 first, tx.fhir.org for the rest
    python scripts/dcmterm.py suggest findings/codes.csv -o findings/entire_flavour.csv
    ```
    This turns "these codes are suspicious" into "this code denotes a vein and
    the segment calls it bowel", and detects the "Entire X" flavour (issue 8)
    mechanically. Record each verdict once in the review table - `WRONG_ANATOMY`,
    `NARROWER_OR_BROADER`, `SPELLING`, `INVERTED`, `UNCODED` - with its
-   `reviewSource` (`dcmterm`, `tx.fhir.org`, `manual`). See
+   `reviewSource` (`dcmterm`, `tx.fhir.org`, `ols4`, `manual`). See
    `references/terminology.md`.
+   **`--server hybrid` is the fast order**, and safe because it is `tx.fhir.org`
+   that answers the codes OLS4 cannot: OLS4 serves an active-concepts-only
+   release, so its misses are the retired-and-nonexistent set. An `ols4` row
+   carries no `active` flag and an `UNRESOLVED` code is unjudged - never report
+   either as missing or retired.
 
 5. **Fold everything in and write the report.**
    ```bash
@@ -229,5 +235,6 @@ catalogue. Read the catalogue before concluding anything about a batch.
 - **Every finding needs a clickable example.** Build a viewer URL into the
   per-segment table from the start (`--viewer-url`, `@@VIEWER_BASE@@`).
 - **Cite every external authority by version**: the DICOM edition `dcmterm.py`
-  prints, the `tx.fhir.org` date, the dicom3tools build, the colour threshold.
+  prints, the `tx.fhir.org` date, the SNOMED release OLS4 printed if it was used,
+  the dicom3tools build, the colour threshold.
   Each verdict is a claim about one edition on one day.

@@ -33,11 +33,15 @@ names. `dcmterm.py property` runs it; see `references/issue-catalogue.md`.
 | Source | Holds | Use for |
 |---|---|---|
 | **dcmterms** — every coded entry in PS3.16's context groups, 14,765 unique codes | Codes DICOM's own context groups use, with the meanings DICOM gives them | Deciding what DICOM *expects*; the "Entire X" argument |
-| **A FHIR terminology server** — `tx.fhir.org`, public, no auth | All of SNOMED CT, with fully specified names and active/inactive status | Everything the first does not cover |
+| **A SNOMED server** — `tx.fhir.org` by default, EBI OLS4 as the fast second | All of SNOMED CT, with fully specified names and active/inactive status | Everything the first does not cover |
+
+The two servers are **not interchangeable** — OLS4 carries no retired concept and its
+label is not reliably the FSN. "A second SNOMED server" below is the whole of that
+argument; read it before quoting an `ols4` row.
 
 **Record which source produced each verdict.** A reader needs to know which findings a
 machine can reproduce and which rest on a human's reading. One column, `reviewSource`,
-values `dcmterm` / `tx.fhir.org` / `manual`.
+values `dcmterm` / `tx.fhir.org` / `ols4` / `manual`.
 
 ### Getting the DICOM code set
 
@@ -112,6 +116,7 @@ rather than noise to normalise away.
 
 ```bash
 python scripts/lookup_codes.py seg_attributes.csv -o findings/codes.csv
+python scripts/lookup_codes.py seg_attributes.csv --server hybrid -o findings/codes.csv
 ```
 
 One row per distinct `(CodingSchemeDesignator, CodeValue)` across the region, type
@@ -119,10 +124,12 @@ and category sequences — a code used in two of them is looked up once — with
 
 | Column | |
 |---|---|
-| `fsn` | Fully specified name from the server |
-| `found` | FALSE means the code does not exist — a finding in itself |
-| `active` | FALSE means a **retired** concept; DICOM objects should not use one |
-| `isEntireFlavour` | `fsn` begins `Entire ` — issue 8 candidate, computed |
+| `fsn` | Fully specified name, on a `tx.fhir.org` row. On an `ols4` row it is a **term**, which is the FSN most of the time and a synonym some of it — see below |
+| `found` | FALSE means the code does not exist — a finding in itself. `UNRESOLVED` means only that OLS4 does not hold it |
+| `active` | FALSE means a **retired** concept; DICOM objects should not use one. **Empty on an `ols4` row**, which cannot answer it |
+| `isEntireFlavour` | A term begins `Entire ` — issue 8 candidate, computed |
+| `source` | Which server answered: `tx.fhir.org` or `ols4`. Empty where the scheme was skipped |
+| `terms` | Every term OLS4 carries for the concept, pipe-separated; empty on a `tx.fhir.org` row |
 | `codeSequences` | Which sequences use the code, semicolon-separated |
 | `meaningsInBatch` | Every distinct `CodeMeaning` the batch records, pipe-separated |
 | `distinctMeanings`, `segments`, `series` | Scale; `segments` counts one per sequence that carries the code |
@@ -138,7 +145,65 @@ https://tx.fhir.org/r4/CodeSystem/$lookup?system=http://snomed.info/sct&code=110
 
 A 404 means the code is not in SNOMED. Private scheme designators (anything that is
 not `SCT`, e.g. `DCM`, `99LOCAL`) are skipped by the script — they cannot be looked up
-there and must be judged against whatever defines them.
+on either server and must be judged against whatever defines them.
+
+### A second SNOMED server, and what it cannot tell you
+
+[EBI OLS4](https://www.ebi.ac.uk/ols4) serves SNOMED CT International with no auth and,
+unlike `tx.fhir.org`, takes concurrent requests — 120 codes in under 7 seconds against
+36 for the polite serial crawl. `--server ols4` uses it; `--server hybrid` screens the
+batch there and sends the residue to `tx.fhir.org`.
+
+It is a second *server*, not a second opinion. It loads `snomed-inferred.owl`, and two
+consequences of that decide what an `ols4` row may be used for:
+
+**It holds active concepts only.** Its obsolete facet for `snomed` is empty. Of 400
+random SCT codes from dcmterms it resolved 257; all 40 of the misses sampled are
+`inactive` on `tx.fhir.org` —
+
+```
+125074003  INACTIVE  Hereford cattle superbreed (organism)
+442595001  INACTIVE  Right ventral-left dorsal oblique projection (qualifier value)
+```
+
+— so OLS4 cannot distinguish a **retired** code from one that never existed, which are
+two different findings. `lookup_codes.py` therefore never writes `active` on an `ols4`
+row and reports a miss as `UNRESOLVED`, not `MISSING`. **An `UNRESOLVED` code is
+unjudged**; re-run it with `--server fhir` before the report calls it anything.
+
+**Its label is not reliably the FSN.** Of the 257 it resolved, `label` was the FSN minus
+its semantic tag for 198, the full FSN including the tag for 22, and a synonym or
+preferred term for 37 — `241620005` comes back as "Cardiac MRI", not "Magnetic resonance
+imaging of heart (procedure)". The semantic tag is usually stripped, so an `ols4` row
+also loses the body-structure / finding / morphologic-abnormality signal. The FSN stem
+is always *somewhere* in the concept's terms, but nothing marks which term it is — which
+is why the `terms` column carries the whole set and `isEntireFlavour` tests all of them.
+That makes the "Entire X" screen unable to miss one, at the cost of a candidate whose
+FSN is something else; confirm with `dcmterm.py suggest` as always.
+
+So, in one line: **use OLS4 to go fast, and `tx.fhir.org` to be right.** The hybrid
+order is the useful one, because the codes OLS4 cannot answer are exactly the ones worth
+the slow server:
+
+```bash
+python scripts/lookup_codes.py seg_attributes.csv --server hybrid -o findings/codes.csv
+```
+
+`--server fhir` also falls back to OLS4 after three consecutive `tx.fhir.org` failures,
+so an outage costs the `active` column rather than the terminology half of the review.
+It says so loudly, and the affected rows say `source=ols4`.
+
+**Cite the release, as with every other authority.** OLS4 reloads nightly and the script
+prints what it served — `http://snomed.info/sct/900000000000207008/version/20251017`.
+The raw requests, if you need them by hand:
+
+```
+https://www.ebi.ac.uk/ols4/api/ontologies/snomed/terms?iri=http://snomed.info/id/110634007
+https://www.ebi.ac.uk/ols4/api/ontologies/snomed          # the version IRI to cite
+```
+
+OLS4 hosts no DICOM (`DCM`) ontology, so it does not narrow the set of codes neither
+source can reach.
 
 ### `SRT` is skipped too, and that is the trap
 
@@ -169,8 +234,9 @@ designator and keeping the value invents codes that do not exist.** Until that m
 is done, the terminology half of this review cannot run on those segments, and the
 report must say so rather than presenting the empty result as a clean one.
 
-**Rate-limit**: the script sleeps between requests. A few hundred codes takes a couple
-of minutes; do not parallelise it into a public server.
+**Rate-limit**: the script sleeps between `tx.fhir.org` requests. A few hundred codes
+takes a couple of minutes; do not parallelise it into that server — `--server hybrid`
+is how to make it faster, since OLS4 accepts the concurrency (`--workers`, default 8).
 
 ## The review table
 
@@ -195,7 +261,7 @@ CodeValue,CodingSchemeDesignator,codeSequence,meaningRecorded,codeActuallyMeans,
 | `meaningRecorded` | yes | the `CodeMeaning` exactly as the batch records it |
 | `codeActuallyMeans` | | what the code denotes, from the FSN |
 | `verdict` | yes | one of the five below |
-| `reviewSource` | | `dcmterm`, `tx.fhir.org` or `manual` |
+| `reviewSource` | | `dcmterm`, `tx.fhir.org`, `ols4` or `manual` — `codes.csv`'s `source` column is where it comes from |
 | `issue` | | 1 or 3; informational in the CSV, used by the SQL |
 
 `seg_checks.py` reports how many review rows matched no segment. A non-zero count
