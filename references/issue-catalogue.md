@@ -240,8 +240,9 @@ twice today".
 
 SNOMED carries two body-structure concepts for most anatomy:
 
-- `302508007` "Entire colon (body structure)" — the whole organ, **exclusively**
-- `71854001` "Colon structure (body structure)" — the organ **or any part of it**
+- `302508007` "Entire colon (body structure)" — the complete organ only
+- `71854001` "Colon structure (body structure)" — the parent concept: the organ or any
+  part of it
 
 DICOM's context groups draw on the *structure* flavour. A segmentation of part of the
 colon coded "Entire colon" asserts more than was segmented.
@@ -249,10 +250,29 @@ colon coded "Entire colon" asserts more than was segmented.
 **Detection.** Mechanical once you have FSNs: flag every code whose fully specified
 name begins `Entire `. `scripts/lookup_codes.py` does this.
 
-**PS3.16 §6 does not state the rule, so build the evidence from DICOM's own code set**,
-per batch: show that each "Entire" code the batch uses is **absent** from DICOM's
-context groups while its structure counterpart is **present**. That is an argument;
-"DICOM prefers it" is not.
+**The rule is stated, in PS3.16 §8.1.1 "Use of SNOMED Anatomic Concepts"**, so cite it
+rather than reconstructing it:
+
+> In general, DICOM uses the anatomic concepts with the term "structure", rather than
+> with the term "entire"... Since imaging typically targets both the anatomic feature
+> and the area around it, or sometimes just part of the anatomic feature, DICOM usually
+> uses "structure" concepts that are more inclusive than the "entire" concepts.
+
+Two things about how it is phrased decide the severity. It is **"in general" and
+"usually", not a *shall*** — so this is a Medium, and a report that calls it a
+conformance violation overstates. And it is **not applied uniformly**: CID 4031
+includes `38266002` "Entire body", so a code's mere presence in a context group does
+not settle it.
+
+That is why the per-batch evidence is still worth producing alongside the citation:
+show that each "Entire" code the batch uses is **absent** from DICOM's context groups
+while its structure counterpart is **present**. The quotation says what DICOM intends;
+the table says what DICOM did.
+
+**DICOM's own Code Meanings will not tell you which flavour a code is.** They never
+carry the "structure" or "entire" suffix — CID 4031 lists `71854001` as plain "Colon".
+Only the code value distinguishes them, which is exactly why this check needs the FSN
+lookup and cannot be run on meanings.
 
 `scripts/dcmterm.py suggest findings/codes.csv` produces both halves from the public
 dcmterms Parquet: whether DICOM carries the "Entire" code, and what the

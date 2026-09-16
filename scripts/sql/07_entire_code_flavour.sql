@@ -7,17 +7,31 @@
 # One row per affected segment.
 #
 # SNOMED carries two body-structure concepts for most anatomy: 302508007
-# "Entire colon (body structure)" denotes the whole organ EXCLUSIVELY, while
-# 71854001 "Colon structure (body structure)" denotes the organ OR ANY PART of
-# it. DICOM's context groups draw on the structure flavour, so a segmentation of
-# part of an organ coded "Entire ..." asserts more than was segmented.
+# "Entire colon (body structure)" denotes the complete organ only, while
+# 71854001 "Colon structure (body structure)" is the parent concept, denoting
+# the organ OR ANY PART of it. DICOM's context groups draw on the structure
+# flavour, so a segmentation of part of an organ coded "Entire ..." asserts more
+# than was segmented.
 #
-# PS3.16 section 6 does not state the rule, so BUILD THE EVIDENCE PER BATCH:
-# show that each "Entire" code the batch uses is ABSENT from the DICOM-derived
-# code table while its structure counterpart is PRESENT. Argue it that way, from
-# DICOM's own code set, rather than asserting a preference. scripts/dcmterm.py
-# suggest reports both halves against the public dcmterms Parquet, and names the
-# DICOM edition.
+# PS3.16 section 8.1.1 "Use of SNOMED Anatomic Concepts" STATES the rule: "In
+# general, DICOM uses the anatomic concepts with the term 'structure', rather
+# than with the term 'entire'... Since imaging typically targets both the
+# anatomic feature and the area around it, or sometimes just part of the
+# anatomic feature, DICOM usually uses 'structure' concepts that are more
+# inclusive than the 'entire' concepts." Cite it.
+#
+# It says "in general" and "usually", not "shall", which is why this is a Medium
+# and not a conformance violation - and it is not applied uniformly, since
+# CID 4031 includes 38266002 "Entire body". So ALSO BUILD THE EVIDENCE PER
+# BATCH: show that each "Entire" code the batch uses is ABSENT from the
+# DICOM-derived code table while its structure counterpart is PRESENT. The
+# quotation says what DICOM intends; the table says what DICOM did.
+# scripts/dcmterm.py suggest reports both halves against the public dcmterms
+# Parquet, and names the DICOM edition.
+#
+# Note that DICOM's Code Meanings never carry the "structure"/"entire" suffix -
+# CID 4031 lists 71854001 as plain "Colon" - so only the code value tells you
+# which flavour is in play. That is why this check needs the FSN lookup.
 #
 # Detection is mechanical once you have fully specified names: flag every code
 # whose FSN begins "Entire ". scripts/lookup_codes.py does that and writes

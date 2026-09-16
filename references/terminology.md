@@ -179,16 +179,19 @@ Judgement notes:
 
 SNOMED carries two body-structure concepts for most anatomy:
 
-- `302508007` "Entire colon (body structure)" — the whole organ, **exclusively**
-- `71854001` "Colon structure (body structure)" — the organ **or any part of it**
+- `302508007` "Entire colon (body structure)" — the complete organ only
+- `71854001` "Colon structure (body structure)" — the parent concept: the organ
+  or any part of it
 
-DICOM's context groups draw on the *structure* flavour, so a segmentation of part of an
-organ coded "Entire …" asserts more than was segmented.
+DICOM's context groups draw on the *structure* flavour (e.g. CID 4031 lists
+`71854001` with Code Meaning "Colon"), so a segmentation of part of an organ
+coded "Entire …" asserts more than was segmented. Note DICOM code meanings
+never carry the "structure"/"entire" suffix — only the code value tells you.
 
-**PS3.16 §6 does not state this rule**, so argue it from DICOM's own code set, per
-batch: show that each "Entire" code the batch uses is **absent** from the
-DICOM-derived table while its structure counterpart is **present**. That is evidence;
-"DICOM prefers it" is not.
+**PS3.16 §8.1.1 "Use of SNOMED Anatomic Concepts" states this**, with two
+rationales: imaging usually covers the feature *plus surrounding area*, and
+sometimes only part of it. Phrased as "in general"/"usually", not a *shall* —
+and not applied uniformly (CID 4031 includes `38266002` "Entire body").
 
 Both halves of that argument are now reproducible in one command. `lookup_codes.py`
 writes `isEntireFlavour` from the FSN; `dcmterm.py suggest` takes that file and, for
