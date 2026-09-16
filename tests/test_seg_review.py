@@ -23,10 +23,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 from pydicom.dataset import Dataset  # noqa: E402
 
+import cielab  # noqa: E402
 import dciodvfy_check  # noqa: E402
 import dcmterm  # noqa: E402
 import seg_attributes  # noqa: E402
 import seg_checks  # noqa: E402
+import seg_encoding  # noqa: E402
 
 
 def code(value, meaning, scheme="SCT"):
@@ -727,6 +729,406 @@ class TestIodTagsJoinTheTriage(unittest.TestCase):
         the same thing on all three access paths."""
         out = self.triage_with([("S1", "Warning", "DEPRECATED_CODING_SCHEME")])
         self.assertNotIn("IOD_", out[0]["issues"])
+
+
+# ---------------------------------------------------------------------------
+# Issue 13 - CIELab. The scaling is PS3.3 C.10.7.1.1; the RGB leg inverts
+# PixelMed's sRGB -> D50 -> Lab, which is what dcmqi and most SEG writers do.
+# ---------------------------------------------------------------------------
+
+# sRGB -> CIELab (D50 PCS) computed independently, so a change to cielab.py
+# that breaks the round trip fails here rather than quietly shifting colours.
+SRGB_TO_LAB_D50 = {
+    (255, 255, 255): (65535, 32896, 32896),
+    (0, 0, 0): (0, 32896, 32896),
+    (255, 0, 0): (35580, 53665, 50856),
+    (0, 255, 0): (57552, 12519, 53710),
+    (0, 0, 255): (19377, 50449, 4104),
+    (128, 128, 128): (35117, 32896, 32896),
+}
+
+
+class TestCIELab(unittest.TestCase):
+    def test_stored_values_render_to_the_expected_srgb(self):
+        for rgb, stored in SRGB_TO_LAB_D50.items():
+            self.assertEqual(cielab.to_rgb(stored), rgb, msg=str(stored))
+
+    def test_scaling_follows_c_10_7_1_1(self):
+        """L* 0..100 over the full range; a*/b* offset so 0x8080 is zero."""
+        lightness, a_star, b_star = cielab.to_lab((65535, 32896, 32896))
+        self.assertAlmostEqual(lightness, 100.0, places=3)
+        self.assertAlmostEqual(a_star, 0.0, places=1)
+        self.assertAlmostEqual(b_star, 0.0, places=1)
+        self.assertAlmostEqual(cielab.to_lab((0, 0, 0))[1], -128.0, places=3)
+        self.assertAlmostEqual(cielab.to_lab((0, 65535, 0))[1], 127.0, places=3)
+
+    def test_parse_accepts_every_way_the_triplet_is_written(self):
+        for text in ("1/2/3", "1\\2\\3", "[1, 2, 3]", "1 2 3"):
+            self.assertEqual(cielab.parse(text), (1, 2, 3), msg=text)
+        self.assertEqual(cielab.parse([1, 2, 3]), (1, 2, 3))
+
+    def test_absent_is_none_but_malformed_raises(self):
+        """Absence is the normal case for a Type 3 attribute and is a finding
+        of its own; a present-but-wrong value is a different finding."""
+        self.assertIsNone(cielab.parse(""))
+        self.assertIsNone(cielab.parse(None))
+        with self.assertRaises(ValueError):
+            cielab.parse("1/2")
+        with self.assertRaises(ValueError):
+            cielab.parse("1/2/3/4")
+        with self.assertRaises(ValueError):
+            cielab.parse("1/2/99999")
+
+    def test_delta_e_is_in_lab_units(self):
+        red = SRGB_TO_LAB_D50[(255, 0, 0)]
+        green = SRGB_TO_LAB_D50[(0, 255, 0)]
+        self.assertEqual(cielab.delta_e(red, red), 0.0)
+        self.assertGreater(cielab.delta_e(red, green), 100)
+
+    def test_swatch_is_self_contained_svg(self):
+        svg = cielab.swatch_svg(SRGB_TO_LAB_D50[(255, 0, 0)])
+        self.assertIn('xmlns="http://www.w3.org/2000/svg"', svg)
+        self.assertIn('fill="#ff0000"', svg)
+        # Without a stroke a white swatch is invisible on a white page.
+        self.assertIn("stroke=", svg)
+
+
+class TestRecommendedColor(unittest.TestCase):
+    RED = "35580/53665/50856"
+    NEAR_RED = "35600/53600/50800"
+    GREEN = "57552/12519/53710"
+
+    def rows(self, *colours, **kwargs):
+        """One object, one segment per colour, each a different structure."""
+        same_structure = kwargs.get("same_structure", False)
+        rows = []
+        for index, colour in enumerate(colours, start=1):
+            rows.append({
+                "PatientID": "P1", "StudyInstanceUID": "3.1",
+                "SeriesInstanceUID": "2.1", "SOPInstanceUID": "1.1",
+                "SegmentNumber": str(index), "SegmentLabel": f"Seg {index}",
+                "SegmentedPropertyTypeCodingSchemeDesignator": "SCT",
+                "SegmentedPropertyTypeCodeValue": "4147007"
+                if same_structure else f"100000{index}",
+                "SegmentedPropertyTypeCodeMeaning": "Mass",
+                "AnatomicRegionCodingSchemeDesignator": "SCT",
+                "AnatomicRegionCodeValue": "10200004",
+                "AnatomicRegionCodeMeaning": "Liver",
+                "RecommendedDisplayCIELabValue": colour,
+                "SegmentationType": kwargs.get("segmentation_type", "BINARY"),
+                "PhotometricInterpretation": kwargs.get(
+                    "photometric", "MONOCHROME2"),
+                "SeriesDescription": "SEG", "viewer_url": "",
+            })
+        return rows
+
+    def issues(self, findings):
+        return {f["colorIssue"] for f in findings}
+
+    def test_same_colour_different_structures_is_a_duplicate(self):
+        findings, _ = seg_checks.recommended_color(self.rows(self.RED, self.RED))
+        self.assertIn("DUPLICATE_IN_OBJECT", self.issues(findings))
+
+    def test_same_colour_same_structure_is_not_a_finding(self):
+        """The point of a colour convention. Reporting it would flag every
+        consistent delivery in existence."""
+        findings, _ = seg_checks.recommended_color(
+            self.rows(self.RED, self.RED, same_structure=True))
+        self.assertNotIn("DUPLICATE_IN_OBJECT", self.issues(findings))
+        self.assertNotIn("CONFUSABLE_IN_OBJECT", self.issues(findings))
+
+    def test_near_colours_are_confusable_below_the_threshold_only(self):
+        rows = self.rows(self.RED, self.NEAR_RED)
+        findings, _ = seg_checks.recommended_color(rows, threshold=10.0)
+        self.assertIn("CONFUSABLE_IN_OBJECT", self.issues(findings))
+        findings, _ = seg_checks.recommended_color(rows, threshold=0.001)
+        self.assertNotIn("CONFUSABLE_IN_OBJECT", self.issues(findings))
+
+    def test_distinct_colours_are_clean(self):
+        findings, palette = seg_checks.recommended_color(
+            self.rows(self.RED, self.GREEN))
+        self.assertEqual(self.issues(findings), set())
+        self.assertEqual(len(palette), 2)
+
+    def test_absent_colour_is_reported_but_not_as_a_collision(self):
+        findings, palette = seg_checks.recommended_color(self.rows("", ""))
+        self.assertEqual(self.issues(findings), {"ABSENT"})
+        self.assertEqual(palette, [])
+
+    def test_malformed_colour_is_separated_from_absent(self):
+        findings, _ = seg_checks.recommended_color(self.rows("1/2"))
+        self.assertEqual(self.issues(findings), {"MALFORMED"})
+
+    def test_palette_colour_labelmap_must_not_carry_the_attribute(self):
+        """PS3.3 C.8.20.2: the palette already carries the colour."""
+        findings, _ = seg_checks.recommended_color(
+            self.rows(self.RED, segmentation_type="LABELMAP",
+                      photometric="PALETTE COLOR"))
+        self.assertIn("NOT_PERMITTED", self.issues(findings))
+
+    def test_one_structure_two_colours_across_the_batch(self):
+        rows = self.rows(self.RED, same_structure=True)
+        other = self.rows(self.GREEN, same_structure=True)
+        other[0]["SOPInstanceUID"] = "1.2"
+        other[0]["SeriesInstanceUID"] = "2.2"
+        findings, _ = seg_checks.recommended_color(rows + other)
+        self.assertIn("INCONSISTENT_ACROSS_BATCH", self.issues(findings))
+
+    def test_collisions_are_one_row_per_segment_not_per_pair(self):
+        """A three-way collision is one recolouring job, not three."""
+        findings, _ = seg_checks.recommended_color(
+            self.rows(self.RED, self.RED, self.RED))
+        collisions = [f for f in findings
+                      if f["colorIssue"] == "DUPLICATE_IN_OBJECT"]
+        self.assertEqual(len(collisions), 3)
+        self.assertEqual(collisions[0]["collidesWithSegments"], "2;3")
+
+    def test_palette_counts_structures_and_marks_sharing(self):
+        _, palette = seg_checks.recommended_color(self.rows(self.RED, self.RED))
+        self.assertEqual(len(palette), 1)
+        self.assertEqual(palette[0]["segments"], 2)
+        self.assertEqual(palette[0]["distinctStructures"], 2)
+        self.assertEqual(palette[0]["sharedWithinObject"], "True")
+        self.assertEqual(palette[0]["hex"], "#ff0000")
+
+
+# ---------------------------------------------------------------------------
+# Issue 14 - does a non-MANUAL segment say what made it?
+# ---------------------------------------------------------------------------
+
+
+class TestAlgorithmIdentification(unittest.TestCase):
+    def row(self, **overrides):
+        row = {
+            "PatientID": "P1", "StudyInstanceUID": "3.1",
+            "SeriesInstanceUID": "2.1", "SOPInstanceUID": "1.1",
+            "SegmentNumber": "1", "SegmentLabel": "Tumour",
+            "SegmentAlgorithmType": "AUTOMATIC",
+            "SegmentAlgorithmName": "nnU-Net",
+            "hasAlgorithmIdentification": "True",
+            "AlgorithmName": "nnU-Net", "AlgorithmVersion": "2.4.1",
+            "AlgorithmSource": "Acme", "AlgorithmNameCodeMeaning": "",
+            "ManufacturerModelName": "dcmqi", "SoftwareVersion": "1.3.4",
+            "SeriesDescription": "SEG", "viewer_url": "",
+        }
+        row.update(overrides)
+        return row
+
+    def issues(self, **overrides):
+        findings = seg_checks.algorithm_identification([self.row(**overrides)])
+        return findings[0]["algorithmIssues"].split("; ") if findings else []
+
+    def test_a_fully_identified_automatic_segment_is_clean(self):
+        self.assertEqual(self.issues(), [])
+
+    def test_manual_segments_are_required_to_say_nothing(self):
+        """Type 1C bites only where SegmentAlgorithmType is not MANUAL."""
+        self.assertEqual(
+            self.issues(SegmentAlgorithmType="MANUAL", SegmentAlgorithmName="",
+                        hasAlgorithmIdentification="False"),
+            [])
+
+    def test_missing_name_on_an_automatic_segment_is_the_1c_violation(self):
+        self.assertIn("NAME_MISSING", self.issues(SegmentAlgorithmName=""))
+
+    def test_semiautomatic_is_also_covered(self):
+        self.assertIn("NAME_MISSING",
+                      self.issues(SegmentAlgorithmType="SEMIAUTOMATIC",
+                                  SegmentAlgorithmName=""))
+
+    def test_a_name_that_identifies_nothing(self):
+        for name in ("unknown", "N/A", "  AI  ", "segmentation", "dcmqi"):
+            self.assertIn("NAME_UNINFORMATIVE",
+                          self.issues(SegmentAlgorithmName=name), msg=name)
+
+    def test_a_real_name_is_not_uninformative(self):
+        for name in ("nnU-Net", "TotalSegmentator v2", "MONAI Auto3DSeg"):
+            self.assertNotIn("NAME_UNINFORMATIVE",
+                             self.issues(SegmentAlgorithmName=name), msg=name)
+
+    def test_no_identification_sequence_means_no_version(self):
+        issues = self.issues(hasAlgorithmIdentification="False",
+                             AlgorithmVersion="")
+        self.assertIn("NO_IDENTIFICATION", issues)
+        self.assertNotIn("NO_VERSION", issues)
+
+    def test_sequence_present_but_version_empty(self):
+        issues = self.issues(AlgorithmVersion="")
+        self.assertIn("NO_VERSION", issues)
+        self.assertNotIn("NO_IDENTIFICATION", issues)
+
+    def test_the_two_tags_split_conformance_from_provenance(self):
+        """Built through the extractor, so the triage list is fed exactly the
+        columns a real run would give it."""
+        no_name = segment(1, "A")
+        versioned = segment(2, "B")
+        versioned.SegmentAlgorithmName = "nnU-Net"
+        identification = Dataset()
+        identification.AlgorithmName = "nnU-Net"
+        identification.AlgorithmVersion = ""
+        versioned.SegmentationAlgorithmIdentificationSequence = [identification]
+        rows = rows_for([instance([no_name, versioned])])
+
+        findings = seg_checks.algorithm_identification(rows)
+        reasons = {f["SegmentNumber"]: f["algorithmIssues"] for f in findings}
+        self.assertIn("NAME_MISSING", reasons["1"])
+        self.assertIn("NO_VERSION", reasons["2"])
+
+        out = seg_checks.triage(rows, {}, set(), {}, {}, [],
+                                algorithms=findings)
+        self.assertIn("ALGORITHM_NAME_MISSING", out[0]["issues"])
+        self.assertIn("ALGORITHM_UNIDENTIFIED", out[0]["issues"])
+        self.assertEqual(out[0]["worstSeverity"], "Medium")
+
+
+# ---------------------------------------------------------------------------
+# Issue 11 - empty frames. The bit-packing rule is PS3.5 8.1: BINARY frames in
+# Native Format are NOT padded, so a frame can start mid-byte.
+# ---------------------------------------------------------------------------
+
+
+def pack(bits):
+    """Pixel bits -> DICOM's packing: first pixel in the least significant bit."""
+    data = bytearray((len(bits) + 7) // 8)
+    for index, bit in enumerate(bits):
+        if bit:
+            data[index // 8] |= 1 << (index % 8)
+    return bytes(data)
+
+
+class TestEmptyFrames(unittest.TestCase):
+    def test_byte_aligned_binary_frames(self):
+        data = pack([0] * 64 + [0] * 32 + [1] + [0] * 31 + [0] * 64)
+        verdicts = [seg_encoding.frame_is_empty(data, i, 8, 8, 1)
+                    for i in range(3)]
+        self.assertEqual(verdicts, [True, False, True])
+
+    def test_frames_that_start_mid_byte(self):
+        """3x3 = 9 bits a frame, so frame 1 begins in the middle of byte 1. A
+        byte-sliced implementation reads frame 0's pixels here and calls an
+        empty frame full."""
+        bits = [0] * 27
+        bits[9 + 4] = 1
+        data = pack(bits)
+        verdicts = [seg_encoding.frame_is_empty(data, i, 3, 3, 1)
+                    for i in range(3)]
+        self.assertEqual(verdicts, [True, False, True])
+
+    def test_a_set_pixel_in_the_last_frame_is_seen(self):
+        bits = [0] * 27
+        bits[26] = 1
+        data = pack(bits)
+        self.assertFalse(seg_encoding.frame_is_empty(data, 2, 3, 3, 1))
+
+    def test_multi_byte_frames(self):
+        data = bytes(64) + bytes([0, 3] + [0] * 62) + bytes(64)
+        verdicts = [seg_encoding.frame_is_empty(data, i, 8, 8, 8)
+                    for i in range(3)]
+        self.assertEqual(verdicts, [True, False, True])
+
+    def test_short_pixel_data_raises_rather_than_reading_past_the_end(self):
+        """NumberOfFrames is a claim; the pixel data is the measurement."""
+        with self.assertRaises(ValueError):
+            seg_encoding.frame_is_empty(bytes(8), 3, 8, 8, 1)
+
+    def test_encapsulated_frames_are_byte_aligned(self):
+        """PS3.5 A.4.13: one frame, one fragment - so unlike the native case a
+        frame starts on a byte and the bits past the last pixel are not ours."""
+        payload = pack([0] * 9 + [1] * 7)  # pixels 9..15 are padding, not data
+        self.assertTrue(seg_encoding.payload_is_empty(payload, 3, 3, 1))
+        self.assertFalse(
+            seg_encoding.payload_is_empty(pack([0] * 8 + [1]), 3, 3, 1))
+
+    def test_labelmap_values_are_about_values_not_frames(self):
+        """One LABELMAP frame carries every segment, so "segment 3 is empty"
+        means the value 3 appears nowhere."""
+        self.assertEqual(seg_encoding.labelmap_values(bytes([0, 1, 1, 4]), 8),
+                         {0, 1, 4})
+        self.assertEqual(
+            seg_encoding.labelmap_values(b"\x01\x00\x02\x00", 16), {1, 2})
+
+
+class TestEncapsulatedPixelData(unittest.TestCase):
+    def encapsulate(self, fragments):
+        import struct
+        out = struct.pack("<HHI", 0xFFFE, 0xE000, 0)  # empty Basic Offset Table
+        for fragment in fragments:
+            out += struct.pack("<HHI", 0xFFFE, 0xE000, len(fragment)) + fragment
+        return out + struct.pack("<HHI", 0xFFFE, 0xE0DD, 0)
+
+    def test_the_basic_offset_table_is_not_a_frame(self):
+        data = self.encapsulate([b"ab", b"cd"])
+        self.assertEqual(seg_encoding.split_fragments(data), [b"ab", b"cd"])
+
+    def test_raw_deflate_and_zlib_wrapped_both_inflate(self):
+        """PS3.5 A.4.13 says RFC1951, i.e. raw. Writers that wrap it exist, and
+        being strict would report a decode failure on readable frames."""
+        import zlib
+        payload = b"\x00" * 32
+        self.assertEqual(seg_encoding.inflate(zlib.compress(payload)[2:-4]),
+                         payload)
+        self.assertEqual(seg_encoding.inflate(zlib.compress(payload)), payload)
+
+    def test_a_non_item_tag_is_an_error_not_a_silent_truncation(self):
+        import struct
+        with self.assertRaises(ValueError):
+            seg_encoding.split_fragments(
+                struct.pack("<HHI", 0x0008, 0x0018, 2) + b"ab")
+
+
+class TestEncodingTags(unittest.TestCase):
+    def tags_for(self, **overrides):
+        import csv as csv_module
+        import tempfile
+        row = {
+            "SeriesInstanceUID": "2.1", "isLossy": "False",
+            "isCompressed": "True", "emptyFrames": "0", "emptySegmentCount": "0",
+        }
+        row.update(overrides)
+        with tempfile.NamedTemporaryFile(
+                "w", suffix=".csv", delete=False, newline="") as handle:
+            writer = csv_module.DictWriter(handle, fieldnames=list(row))
+            writer.writeheader()
+            writer.writerow(row)
+            path = handle.name
+        return seg_checks.encoding_tags(path)["2.1"]
+
+    def test_lossy_is_taken_from_the_transfer_syntax(self):
+        self.assertIn("LOSSY_COMPRESSED", self.tags_for(isLossy="True"))
+
+    def test_lossy_image_compression_01_alone_is_not_a_finding(self):
+        """PS3.3 C.8.20.2.2 requires 01 when the SOURCE images were lossy
+        compressed, so an intact segmentation of a lossy CT carries it."""
+        tags = self.tags_for(LossyImageCompression="01")
+        self.assertNotIn("LOSSY_COMPRESSED", tags)
+
+    def test_uncompressed_and_empty_frames(self):
+        tags = self.tags_for(isCompressed="False", emptyFrames="12",
+                             emptySegmentCount="1")
+        self.assertEqual(
+            set(tags),
+            {"UNCOMPRESSED", "EMPTY_FRAMES_RETAINED", "EMPTY_SEGMENT"})
+
+    def test_lossy_and_uncompressed_are_exclusive(self):
+        tags = self.tags_for(isLossy="True", isCompressed="True")
+        self.assertNotIn("UNCOMPRESSED", tags)
+
+    def test_the_tags_reach_the_triage_list(self):
+        rows = rows_for([instance([segment(1, "A")], series="2.1")])
+        encoding = {"2.1": Counter({"LOSSY_COMPRESSED": 1})}
+        out = seg_checks.triage(rows, {}, set(), {}, {}, [], encoding=encoding)
+        self.assertIn("LOSSY_COMPRESSED", out[0]["issues"])
+        self.assertEqual(out[0]["worstSeverity"], "High")
+
+    def test_a_series_with_no_encoding_row_carries_no_encoding_tag(self):
+        """Silence means "not checked", not "uncompressed" - the BigQuery and
+        DICOMweb paths always look like this."""
+        rows = rows_for([instance([segment(1, "A")], series="2.1")])
+        out = seg_checks.triage(rows, {}, set(), {}, {}, [])
+        for tag in ("LOSSY_COMPRESSED", "UNCOMPRESSED", "EMPTY_FRAMES_RETAINED",
+                    "EMPTY_SEGMENT"):
+            self.assertNotIn(tag, out[0]["issues"])
+
 
 
 if __name__ == "__main__":

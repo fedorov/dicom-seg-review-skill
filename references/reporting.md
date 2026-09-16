@@ -59,6 +59,19 @@ That sentence is what a busy reader takes away.
   `issue9_iod_validation_summary.csv` is already one row per distinct defect with the
   instances, series and segments it touches. Pair it with the boundary statement:
   dciodvfy checks structure, so a clean run is not evidence about the coding.
+- For issue 11, lead with the **measurement, not the preference**: what fraction of
+  frames are empty and what they cost in bytes. Omitting them is conformant and so is
+  keeping them, so the number is the whole argument. For issue 12, quote the
+  **measured** deflated size beside the delivered one — `seg_encoding.py` compresses
+  each object's pixel data to get it — and name the transfer syntax you are
+  recommending by UID, with what can read it today.
+- For issue 13, **show the colours**. See "Colour, in a Markdown report" below.
+- For issue 14, separate the **Type 1C violation** (a missing
+  `SegmentAlgorithmName` on a non-MANUAL segment — non-conformant) from the
+  **provenance gap** (no `SegmentationAlgorithmIdentificationSequence`, so no
+  version — conformant, and still the reason nobody can say which model version
+  produced the delivery). A reader who cannot tell which is which will either
+  over- or under-react to both.
 - Any **reassuring negative** the check establishes. "No TrackingUID is shared across
   patients, and none is repeated within a series" bounds the problem and lets a reader
   respond proportionately. A report that lists only what is broken cannot be acted on.
@@ -89,6 +102,12 @@ terminology sources and the IOD validator:
 > Codes were checked against DICOM 2026c (dcmterms, extracted 2026-07-02) and, for
 > those DICOM does not carry, against SNOMED CT via `tx.fhir.org` on 2026-09-15.
 > Objects were validated against the IOD with dciodvfy (dicom3tools 20260901).
+> Colours within an object were compared in CIELab, calling two confusable below
+> 10 dE*ab (`--color-delta-e`).
+
+The colour threshold belongs in that list for the same reason the others do: it is
+a choice, not a fact, and a reader who disagrees with it needs to know which value
+produced the counts.
 
 All three move. "This code is not in DICOM's code set", "this code is retired" and
 "this object does not conform" are claims about a particular edition, or a particular
@@ -98,6 +117,49 @@ copy.
 
 Without that paragraph the next person runs the whole set against a new batch and
 trusts stale verdicts.
+
+## Colour, in a Markdown report
+
+A colour finding a reader cannot see is half a finding. "Segments 3 and 7 share
+`43620/34952/32896`" is unarguable and unreadable; a swatch beside it is the
+evidence.
+
+**No Markdown renderer agrees on how to show a colour**, and the three obvious
+approaches each fail somewhere that matters:
+
+| Approach | Fails because |
+|---|---|
+| `<span style="background:#c00">` | GitHub strips the `style` attribute. The cell renders as blank text. |
+| `<img src="data:image/png;base64,...">` | GitHub refuses `data:` image sources. Broken image. |
+| `` `#RRGGBB` `` chip syntax | Works in issues, pull requests and discussions — **not** in a committed `.md` file. |
+
+What survives all of them is a **small SVG file referenced relatively**.
+`seg_checks.py` writes one per distinct colour into `findings/swatches/` and
+`findings/issue13_color_palette.md` as a paste-ready table:
+
+```markdown
+| Colour | Hex | L\*a\*b\* | Segments | Series | Structures |
+|---|---|---|---|---|---|
+| <img src="swatches/ff0000.svg" width="16" height="16" alt="#ff0000"> | `#ff0000` **shared** | 54.3 / 80.8 / 69.9 | 3 | 2 | Mass / Liver; Neoplasm / Lung |
+```
+
+Three rules for using it:
+
+- **Keep the swatches with the report.** The `<img>` paths are relative to the
+  Markdown file. Moving the report without `swatches/` leaves broken images.
+- **Always print the hex as text in the same row**, as the table above does. A
+  swatch that fails to load must still leave the reader with the value, and a
+  reader quoting the colour in a bug report needs text, not a picture. This is
+  the same rule as "the UID as text, the link on the UID".
+- **Say what the swatch is.** It is an sRGB rendering of the stored CIELab
+  assuming the D50 white point of the ICC PCS, and writers differ at the margins,
+  so it shows the producer's intent rather than proving anything. Every finding
+  in issue 13 is decided in CIELab; the script prints that sentence under the
+  table for you.
+
+Publish the palette even when nothing is wrong. "What colours does this delivery
+assign?" is a question a reader has before any finding, and the answer is one
+table.
 
 ## The per-series triage list
 
@@ -125,25 +187,43 @@ ANATOMY_CONFLICT           High      issue 1
 CODE_SELF_INCONSISTENT     High      issue 2
 CODE_MEANING_MINORITY      High      issue 2
 TRACKINGUID_CROSS_PATIENT  High      issue 7
+LOSSY_COMPRESSED           High      issue 12 - local files only
 ENTIRE_CODE_FLAVOUR        Medium    issue 8
 LATERALITY_UNCODED         Medium    issue 3
 MALFORMED_SEGMENT          Medium    issue 4
 RETIRED_CODING_SCHEME      Medium    issue 10
 IOD_ERROR                  Medium    issue 9 - local files only
 TRACKINGUID_AMBIGUOUS      Medium    issue 7
+EMPTY_SEGMENT              Medium    issue 11 - local files only
+COLOR_DUPLICATE            Medium    issue 13
+COLOR_NOT_PERMITTED        Medium    issue 13
+COLOR_MALFORMED            Medium    issue 13
+ALGORITHM_NAME_MISSING     Medium    issue 14
 COSMETIC_VARIANT           Low       issue 2
 IOD_WARNING                Low       issue 9 - local files only
 CODE_MEANING_SPELLING      Low       issue 1
 TYPE_REPEATS_CATEGORY      Low       issue 5
 NO_SEGMENTS_OVERLAP        Low       issue 6
+EMPTY_FRAMES_RETAINED      Low       issue 11 - local files only
+UNCOMPRESSED               Low       issue 12 - local files only
+COLOR_CONFUSABLE           Low       issue 13
+COLOR_INCONSISTENT         Low       issue 13
+COLOR_ABSENT               Low       issue 13
+ALGORITHM_UNIDENTIFIED     Low       issue 14
 CODE_AMBIGUOUS_ELSEWHERE   context   issue 2 — does NOT raise worstSeverity
 ```
 
 `scripts/seg_checks.py` and `scripts/sql/12_series_triage.sql` emit the same tags,
-with one exception: `IOD_ERROR` and `IOD_WARNING` come from `dciodvfy`, which needs
-the objects rather than a metadata table, so the SQL cannot produce them. A triage
-list built on BigQuery is **silent** about IOD conformance. Say that in the report
+with one class of exception: the six tags marked *local files only* come from the
+objects rather than from a metadata table. `IOD_ERROR` / `IOD_WARNING` need
+`dciodvfy` (issue 9); `EMPTY_SEGMENT` / `EMPTY_FRAMES_RETAINED` need the pixel data
+(issue 11); `UNCOMPRESSED` / `LOSSY_COMPRESSED` need the file meta group, which a
+BigQuery export drops and a DICOMweb metadata response does not return (issue 12). A
+triage list built on BigQuery is **silent** about all six. Say that in the report
 rather than letting the silence read as a pass.
+
+`seg_checks.py` prints which of them ran. Six tags absent because the check did not
+run looks identical, in a CSV, to six tags absent because nothing was wrong.
 
 `COSMETIC_VARIANT` differs in how it is decided: the SQL reads a curated code list,
 while the script offers near-match candidates (`cosmeticCandidate` in

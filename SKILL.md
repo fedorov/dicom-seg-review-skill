@@ -1,9 +1,9 @@
 ---
 name: dicom-seg-review
-description: Review a delivery of DICOM Segmentation (SEG) objects for defects in how they are coded and encoded — anatomic codes that contradict their own CodeMeaning, one code used with conflicting meanings, inverted or uncoded laterality, IOD non-conformance and malformed pixel data found by dciodvfy, retired coding scheme designators, ambiguous TrackingUIDs, wrong SNOMED code flavour — and produce a severity-ranked report plus a per-series triage list. Use when asked to audit, QC, review, validate or sanity-check DICOM segmentations, their anatomic/SNOMED coding, or their conformance to the Segmentation IOD, whether the objects are reachable through BigQuery, a DICOMweb store, or local DICOM files.
+description: Review a delivery of DICOM Segmentation (SEG) objects for defects in how they are coded and encoded — anatomic codes that contradict their own CodeMeaning, one code used with conflicting meanings, inverted or uncoded laterality, IOD non-conformance and malformed pixel data found by dciodvfy, retired coding scheme designators, ambiguous TrackingUIDs, wrong SNOMED code flavour, all-zero frames a BINARY object should have omitted, missing or lossy compression, recommended display colours that collide between structures, and automatic segments that do not identify the algorithm or model that produced them — and produce a severity-ranked report plus a per-series triage list. Use when asked to audit, QC, review, validate or sanity-check DICOM segmentations, their anatomic/SNOMED coding, their display colours, their provenance, their size and compression, or their conformance to the Segmentation IOD, whether the objects are reachable through BigQuery, a DICOMweb store, or local DICOM files.
 license: Apache-2.0
 metadata:
-  version: 1.2.0
+  version: 1.3.0
   skill-author: Andrey Fedorov, @fedorov
 ---
 
@@ -17,12 +17,15 @@ bowel" while its code denotes the liver, one code carrying five different meanin
 left structure coded as the right one, a segment missing Type 1 attributes, an object
 whose `PixelData` is the wrong length for the frames it claims.
 
-**The boundary is the voxel values, not the pixel data.** Nothing here interprets what
-was segmented, so it cannot tell you the liver segmentation covers the liver. It does
-check that the pixel data is the size the metadata says it is — `dciodvfy` reads
-`PixelData` and compares its length against Rows × Columns × Frames × BitsAllocated,
-which catches a truncated or mis-framed object that every other check would pass.
-Everything except issue 9 works from metadata alone.
+**The boundary is what the voxels mean, not the voxels themselves.** Nothing here
+interprets what was segmented, so it cannot tell you the liver segmentation covers
+the liver. Two checks do read the pixel data, and neither needs to know anatomy to
+do it: `dciodvfy` compares `PixelData`'s length against Rows × Columns × Frames ×
+BitsAllocated, catching a truncated or mis-framed object (issue 9), and
+`seg_encoding.py` asks of each frame only "is every bit zero", which is what finds
+the empty frames a BINARY object should have omitted and the segments that hold
+nothing at all (issue 11). Everything except issues 9, 11 and 12 works from
+metadata alone.
 
 **Two deliverables**, both described in `references/reporting.md`:
 1. A severity-ranked issue report — what is wrong, how much of the batch, worked
@@ -62,11 +65,19 @@ that. Pick by what access you have:
 If more than one is available, prefer BigQuery — the checks are set-based and a
 whole delivery is one query.
 
-**One check needs the files themselves.** Issue 9 runs `dciodvfy` against each
-object, and neither a metadata table nor a DICOMweb metadata response is an
-object. Where the delivery is reachable as files, run it; where it is not,
-retrieve a sample and say in the report that IOD conformance was checked on a
-sample, or not at all. Silence on issue 9 must not read as a pass.
+**Three checks need the files themselves**, and for three different reasons:
+
+| Issue | Needs | Because |
+|---|---|---|
+| 9 — IOD conformance | the object | `dciodvfy` validates an object; a metadata row is not one |
+| 11 — empty frames | the pixel data | no export carries voxels |
+| 12 — compression | the file meta group | (0002,0010) is dropped by a BigQuery export and not returned by DICOMweb metadata |
+
+Where the delivery is reachable as files, run all three; where it is not, retrieve a
+sample and say in the report that they were checked on a sample, or not at all.
+**Silence on issues 9, 11 and 12 must not read as a pass** — in a triage CSV, a tag
+absent because the check never ran is indistinguishable from a tag absent because
+nothing was wrong.
 
 ## Workflow
 
@@ -97,9 +108,14 @@ data never had a problem with.
      `dciodvfy` reads the whole Segmentation IOD, so it supersedes the hand-rolled
      Type 1 check. It validates **structure, not semantics** — it will never find a
      miscoded anatomic region, and a clean run is not a statement about the coding.
+   - **Against the encoding** (`scripts/seg_encoding.py`), if the files are on
+     disk. Empty frames a BINARY object kept, segments with no voxels at all, the
+     transfer syntax, and what deflate would actually have saved — measured on the
+     delivery's own pixel data rather than asserted.
    - Retired coding scheme designators (`SRT`, `SNM3`). Cheap, and it decides
      whether the terminology steps below can work at all — see the trap below.
-   - Conformance, type-repeats-category, SegmentsOverlap, TrackingUID.
+   - Conformance, type-repeats-category, SegmentsOverlap, TrackingUID, display
+     colour, algorithm identification.
 
 4. **Look up every distinct anatomic code's fully specified name** —
    `scripts/lookup_codes.py`. This is what turns "these codes are suspicious" into
@@ -127,6 +143,10 @@ Full detail, DICOM references and detection logic in `references/issue-catalogue
 | 10 | Medium | Codes under a retired scheme designator (`SRT`, `SNM3`) | Computed |
 | 4 | Medium | Segment missing a Type 1 attribute, or a code without its scheme | Computed |
 | 7 | Medium | `TrackingUID` shared in a way that does not mean "same finding" | Computed |
+| 13 | Medium / Low | Two structures given the same display colour; colour absent, malformed, or not permitted | Computed |
+| 14 | Medium / Low | Non-MANUAL segment that does not identify its algorithm or model | Computed |
+| 12 | High / Low | Lossy compressed; or uncompressed where deflate would pay | Computed (needs the files) |
+| 11 | Medium / Low | Segment with no voxels; all-zero frames a BINARY object kept | Computed (needs the files) |
 | 5 | Low | `SegmentedPropertyType` merely repeats the category | Computed |
 | 6 | Low | `SegmentsOverlap` absent (Type 3 — conformant, but costly on multi-segment objects) | Computed |
 
@@ -134,7 +154,9 @@ Numbering is stable so reports cross-reference; the table is in severity order. 
 new issues with the next free number rather than renumbering.
 
 **Anatomic coding is almost always where the damage is.** Issues 1, 2, 3 and 8 are
-all about it. Budget the review accordingly.
+all about it. Budget the review accordingly. Issues 11 to 14 are cheap to run and
+mostly Low — but they are the ones a producer can fix in an afternoon, and the
+follow-up section should say so.
 
 ## Severity is about consumer harm, not scale
 
@@ -212,15 +234,53 @@ concluding anything about a batch.
   `...66.7` (Labelmap Segmentation Storage) so a future labelmap delivery is picked up
   rather than silently dropped.
 
+- **A BINARY segmentation's frames are not byte-aligned.** PS3.5 §8.1: with
+  `BitsAllocated` 1 in Native Format "the individual Frames are not padded... a frame
+  other than the first frame may start in the middle of a byte". So where
+  Rows × Columns is not a multiple of 8, slicing `PixelData` at byte boundaries reads
+  a neighbour's pixels, and an empty frame whose predecessor ended mid-byte reads as
+  non-empty. Mask a bit range. The opposite holds for an **encapsulated** object,
+  where each frame is its own fragment and does start on a byte. Issue 11.
+
+- **`LossyImageCompression` = 01 does not mean this object was lossy compressed.**
+  PS3.3 C.8.20.2.2 requires the value to be `01` when any of the **source images**
+  was, so an intact segmentation of a lossy-compressed CT carries it. Take the
+  verdict from the transfer syntax; reading (0028,2110) the other way manufactures a
+  High finding out of a correct object. Issue 12.
+
+- **Two segments of the same structure sharing a colour is the point, not a defect.**
+  A colour finding is about two *different* structures a viewer will draw
+  identically. Compare structures — the type and anatomic-region codes — not
+  segments, or the check fires on every consistent delivery in existence. Issue 13.
+
+- **Decide colour in CIELab, render it only to show a human.** ΔE\*ab follows from
+  PS3.3 C.10.7.1.1 alone, so "these two are the same colour" is exact; converting to
+  sRGB needs a white point the Standard only implies (the ICC PCS D50, which is what
+  PixelMed and dcmqi assume). A swatch is the producer's intent, not evidence. Issue
+  13.
+
+- **`SegmentAlgorithmName` is Type 1C, not optional.** "Required if Segment Algorithm
+  Type is not MANUAL" — so its absence on an AUTOMATIC segment is a conformance
+  violation, while the missing *version* beside it is not: that lives in
+  `SegmentationAlgorithmIdentificationSequence`, which is Type 3. Report the two
+  differently or a reader will over- or under-react to both. Issue 14.
+
+- **`ManufacturerModelName` is not the model.** On a converted segmentation it names
+  the converter — dcmqi, highdicom — not what did the segmenting. Use it as a
+  cross-check instead: an inference toolkit in that attribute beside
+  `SegmentAlgorithmType = MANUAL` means the batch is misdescribing how it was made.
+  Issue 14.
+
 - **Every finding needs a clickable example.** A study/series UID a reader cannot open
   is not evidence. Build a viewer URL into the per-segment table from the start.
 
 ## Scripts
 
-Run from the skill root. `seg_checks.py` and `lookup_codes.py` are stdlib-only; the
-extractors need `pydicom` or `dicomweb-client`, `dcmterm.py` needs any one of
-`pyarrow`, `duckdb` or `pandas` to read Parquet, and `dciodvfy_check.py` needs
-`pip install dicom3tools` (plus `pydicom`, to resolve segment numbers).
+Run from the skill root. `seg_checks.py`, `lookup_codes.py` and `cielab.py` are
+stdlib-only; the extractors need `pydicom` or `dicomweb-client`, `seg_encoding.py`
+needs `pydicom` (but no pixel-data codec — it reads bytes), `dcmterm.py` needs any
+one of `pyarrow`, `duckdb` or `pandas` to read Parquet, and `dciodvfy_check.py`
+needs `pip install dicom3tools` (plus `pydicom`, to resolve segment numbers).
 
 ```bash
 # 1. Extract the per-segment table (pick one source)
@@ -236,6 +296,10 @@ python scripts/seg_checks.py seg_attributes.csv --outdir findings/
 pip install dicom3tools
 python scripts/dciodvfy_check.py --files /path/to/seg/dir -o findings/
 
+#    Empty frames and compression (issues 11, 12) - local files only. Reads the
+#    pixel data as bytes; no codec, no numpy. Measures what deflate would save.
+python scripts/seg_encoding.py --files /path/to/seg/dir -o findings/
+
 # 3. Against DICOM's own code set: coverage gap + meaning disagreements
 python scripts/dcmterm.py coverage seg_attributes.csv -o findings/coverage.csv
 
@@ -243,14 +307,26 @@ python scripts/dcmterm.py coverage seg_attributes.csv -o findings/coverage.csv
 python scripts/lookup_codes.py seg_attributes.csv -o findings/codes.csv
 python scripts/dcmterm.py suggest findings/codes.csv -o findings/entire_flavour.csv
 
-# 5. Re-run the checks with the FSNs, the IOD verdict and your curated
-#    verdicts folded into the triage list
+# 5. Re-run the checks with the FSNs, the IOD and encoding verdicts and your
+#    curated verdicts folded into the triage list
 python scripts/seg_checks.py seg_attributes.csv \
     --codes findings/codes.csv --review review.csv \
-    --iod findings/issue9_iod_validation.csv --outdir findings/
+    --iod findings/issue9_iod_validation.csv \
+    --encoding findings/encoding_per_object.csv --outdir findings/
+```
+
+Issues 13 and 14 need no extra step — `seg_checks.py` runs them on every invocation,
+and the colour palette comes out as `issue13_color_palette.csv` plus a paste-ready
+`issue13_color_palette.md` with a swatch per row. `scripts/cielab.py` is also a CLI,
+for reading one stored triplet by hand:
+
+```bash
+python scripts/cielab.py 35580/53665/50856
+# 35580/53665/50856  ->  L*=54.3 a*=80.8 b*=69.9  ->  rgb(255,0,0)  #ff0000
 ```
 
 `scripts/sql/` holds the same checks as BigQuery templates, numbered in run order;
 substitute the table name with `--parameter` or `sed`. See
-`references/access-bigquery.md`. Issue 9 has no SQL form — the validator needs the
-objects, not a metadata table.
+`references/access-bigquery.md`. Issues 9, 11 and 12 have no SQL form — the
+validator needs the objects, the empty-frame check needs the voxels, and the
+transfer syntax is in the file meta group, which no export carries.

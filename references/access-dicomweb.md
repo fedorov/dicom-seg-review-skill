@@ -119,7 +119,7 @@ https://viewer.imaging.datacommons.cancer.gov/viewer/{StudyInstanceUID}?SeriesIn
   which the extractor reports as a coverage summary at the end. Read it: an attribute
   empty across the whole batch is a finding, not a blank column.
 
-## Issue 9 cannot run from here
+## Issues 9, 11 and 12 cannot run from here
 
 `dciodvfy` validates a Part 10 object, and a DICOMweb metadata response is not one.
 Retrieving instances with WADO-RS (`application/dicom`) and writing them to disk makes
@@ -135,4 +135,25 @@ Decide deliberately and say which you did:
   hand-rolled Type 1 check (issue 4) still runs and covers five attributes of one
   macro; it is not a substitute, and the triage list will carry no `IOD_ERROR` tag
   whether or not the objects are conformant.
+
+The same retrieval decides issues 11 and 12, for two further reasons:
+
+- **The pixel data never crosses the wire.** `retrieve_series_metadata` excludes bulk
+  data by design — which is what makes this path affordable — so no frame can be
+  tested for emptiness. Issue 11 is unavailable.
+- **The file meta group is not in the metadata response.** `TransferSyntaxUID`
+  (0002,0010) is a property of how the object was *stored*, and a DICOMweb server may
+  well re-encode it on retrieval anyway. Some servers report
+  `AvailableTransferSyntaxUID` (0008,3002) in a QIDO response; if yours does, it tells
+  you what the server can send, not how the delivery arrived. Issue 12 is unavailable,
+  and answering it means retrieving objects with `application/dicom` and running
+  `scripts/seg_encoding.py` on them.
+
+Both are cheap once the sample is on disk — one pass, no codec — so a sample retrieved
+for `dciodvfy` should be run through `seg_encoding.py` at the same time.
+
+Issues 13 and 14 **do** run here: `RecommendedDisplayCIELabValue`,
+`SegmentAlgorithmName` and `SegmentationAlgorithmIdentificationSequence` are all in
+the metadata response, and `seg_attributes.py` extracts them. If the extractor's
+coverage summary lists them as populated by no instance, that absence is the finding.
 

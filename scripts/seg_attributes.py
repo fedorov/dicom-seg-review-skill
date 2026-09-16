@@ -70,8 +70,21 @@ COLUMNS = [
     "SegmentedPropertyTypeModifierCodeMeaning",
     "SegmentAlgorithmType",
     "SegmentAlgorithmName",
+    "hasAlgorithmIdentification",
+    "AlgorithmName",
+    "AlgorithmVersion",
+    "AlgorithmSource",
+    "AlgorithmFamilyCodeValue",
+    "AlgorithmFamilyCodingSchemeDesignator",
+    "AlgorithmFamilyCodeMeaning",
+    "AlgorithmNameCodeValue",
+    "AlgorithmNameCodingSchemeDesignator",
+    "AlgorithmNameCodeMeaning",
+    "RecommendedDisplayCIELabValue",
     "SegmentationType",
     "SegmentsOverlap",
+    "PhotometricInterpretation",
+    "TransferSyntaxUID",
     "Manufacturer",
     "ManufacturerModelName",
     "SoftwareVersion",
@@ -95,6 +108,9 @@ COVERAGE_COLUMNS = [
     "AnatomicRegionModifierCodeValue",
     "SegmentedPropertyTypeModifierCodeValue",
     "SegmentAlgorithmName",
+    "AlgorithmName",
+    "AlgorithmVersion",
+    "RecommendedDisplayCIELabValue",
     "SegmentsOverlap",
     "SegmentDescription",
 ]
@@ -175,6 +191,54 @@ def _scalar(ds, keyword, default=""):
     return "" if value is None else str(value)
 
 
+def _algorithm_identification(segment):
+    """Segmentation Algorithm Identification Sequence (0062,0007), flattened.
+
+    Type 3 on the segment, and the ONLY standard place a model's version lives:
+    Segment Algorithm Name (0062,0009) is a bare string with nowhere to put the
+    version, the source, or a code for the specific algorithm. Inside this
+    sequence, Algorithm Name (0066,0036) and Algorithm Version (0066,0031) are
+    both Type 1 — so a sequence that is present but missing either is itself a
+    finding, which is why the flag is carried separately from the values.
+    PS3.3 Table 10-19. See issue 14.
+    """
+    item = _first(getattr(segment, "SegmentationAlgorithmIdentificationSequence", None))
+    if item is None:
+        return {"hasAlgorithmIdentification": "False"}
+    family = _code(item, "AlgorithmFamilyCodeSequence")
+    name_code = _code(item, "AlgorithmNameCodeSequence")
+    return {
+        "hasAlgorithmIdentification": "True",
+        "AlgorithmName": _scalar(item, "AlgorithmName"),
+        "AlgorithmVersion": _scalar(item, "AlgorithmVersion"),
+        "AlgorithmSource": _scalar(item, "AlgorithmSource"),
+        "AlgorithmFamilyCodeValue": family[0],
+        "AlgorithmFamilyCodingSchemeDesignator": family[1],
+        "AlgorithmFamilyCodeMeaning": family[2],
+        "AlgorithmNameCodeValue": name_code[0],
+        "AlgorithmNameCodingSchemeDesignator": name_code[1],
+        "AlgorithmNameCodeMeaning": name_code[2],
+    }
+
+
+def _cielab(segment):
+    """RecommendedDisplayCIELabValue (0062,000D) as "l/a/b", or "".
+
+    Three unsigned shorts, kept exactly as stored. Nothing is converted here:
+    the scaling is defined in PS3.3 C.10.7.1.1 but rendering it as RGB needs a
+    white point the Standard only implies, so the conversion belongs with the
+    check that uses it (scripts/cielab.py) and not in the extract, where it
+    would look like data. A value with anything other than three components is
+    passed through as-is for issue 13 to report.
+    """
+    value = getattr(segment, "RecommendedDisplayCIELabValue", None)
+    if value is None:
+        return ""
+    if isinstance(value, (list, tuple)) or type(value).__name__ == "MultiValue":
+        return "/".join(str(v) for v in value)
+    return str(value)
+
+
 def extract_instance(ds, viewer_url_pattern=None, collection="", referenced=None):
     """One row per segment of one SEG instance.
 
@@ -199,6 +263,14 @@ def extract_instance(ds, viewer_url_pattern=None, collection="", referenced=None
         "FrameOfReferenceUID": _scalar(ds, "FrameOfReferenceUID"),
         "SegmentationType": _scalar(ds, "SegmentationType"),
         "SegmentsOverlap": _scalar(ds, "SegmentsOverlap"),
+        # Needed by issue 13: (0062,000D) shall NOT be present when a LABELMAP
+        # object is PALETTE COLOR, since the palette already carries the colour.
+        "PhotometricInterpretation": _scalar(ds, "PhotometricInterpretation"),
+        # Issue 12. File meta, so it exists on the local-files path only - a
+        # DICOMweb metadata response and a BigQuery export both drop it.
+        "TransferSyntaxUID": str(
+            getattr(getattr(ds, "file_meta", None), "TransferSyntaxUID", "") or ""
+        ),
         "Manufacturer": _scalar(ds, "Manufacturer"),
         "ManufacturerModelName": _scalar(ds, "ManufacturerModelName"),
         "SoftwareVersion": _scalar(ds, "SoftwareVersions"),
@@ -231,6 +303,7 @@ def extract_instance(ds, viewer_url_pattern=None, collection="", referenced=None
         row.update(instance)
         row["isBackgroundSegment"] = "False"
         row["multiValuedCodeSequence"] = "False"
+        row["hasAlgorithmIdentification"] = "False"
         return [row]
 
     rows = []
@@ -272,6 +345,7 @@ def extract_instance(ds, viewer_url_pattern=None, collection="", referenced=None
                 "SegmentedPropertyTypeModifierCodeMeaning": type_mod[2],
                 "SegmentAlgorithmType": _scalar(segment, "SegmentAlgorithmType"),
                 "SegmentAlgorithmName": _scalar(segment, "SegmentAlgorithmName"),
+                "RecommendedDisplayCIELabValue": _cielab(segment),
                 # Labelmap objects carry a SegmentNumber 0 "Background" segment:
                 # an artefact of the encoding, not a segmented finding. Exclude
                 # it from any count of what was segmented.
@@ -279,6 +353,7 @@ def extract_instance(ds, viewer_url_pattern=None, collection="", referenced=None
                 "multiValuedCodeSequence": str(_multi_valued(segment)),
             }
         )
+        row.update(_algorithm_identification(segment))
         rows.append(row)
     return rows
 
@@ -540,6 +615,19 @@ def main():
             f"\n  !! {multi} segments carry more than one code per sequence. Only the "
             "first\n     was extracted, so every check downstream understates. "
             "Handle these by hand.",
+            file=sys.stderr,
+        )
+
+    # Issue 12 in one line. seg_encoding.py measures what compression would
+    # save; this is only enough to see whether any was applied at all.
+    syntaxes = Counter(r["TransferSyntaxUID"] for r in rows if r["TransferSyntaxUID"])
+    if syntaxes:
+        print("\n  Transfer syntaxes (one count per SEGMENT row):", file=sys.stderr)
+        for uid, count in syntaxes.most_common():
+            print(f"    {uid:<34} {count:>7}", file=sys.stderr)
+        print(
+            "    run scripts/seg_encoding.py to size what deflate would save - "
+            "issue 12",
             file=sys.stderr,
         )
 

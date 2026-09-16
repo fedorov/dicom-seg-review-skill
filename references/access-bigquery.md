@@ -125,10 +125,16 @@ small table once and point the view at it.
 
 ```bash
 for q in scripts/sql/0[2-9]*.sql scripts/sql/1*.sql; do
-  sed 's|@@SEG_ATTRIBUTES@@|<project>.<dataset>.seg_attributes|' "$q" \
+  sed -e 's|@@SEG_ATTRIBUTES@@|<project>.<dataset>.seg_attributes|' \
+      -e 's|@@DELTA_E@@|10|' "$q" \
     | bq query --use_legacy_sql=false --project_id=<project>
 done
 ```
+
+`@@DELTA_E@@` is issue 13's confusability threshold in ΔE\*ab, and `14` and `12` must
+be given the **same** value or the two will disagree about which series are tagged. 10
+matches `seg_checks.py`'s default; the reasoning is in `references/issue-catalogue.md`,
+issue 13. Whichever you use, name it in the report — it is a choice, not a fact.
 
 | File | Check | Layer |
 |---|---|---|
@@ -144,6 +150,16 @@ done
 | `10_segments_overlap_absent.sql` | issue 6 | computed |
 | `11_tracking_uid.sql` | issue 7 | computed |
 | `12_series_triage.sql` | per-series roll-up | both |
+| `13_retired_coding_scheme.sql` | issue 10 | computed |
+| `14_recommended_color.sql` | issue 13 | computed |
+| `15_algorithm_identification.sql` | issue 14 | computed |
+
+File numbers are **not** issue numbers — they are the order the files were added, and
+issues are numbered separately so that a report can cite an issue for good. The
+numbering after `12` looks odd for that reason: the roll-up was written before issues
+10, 13 and 14 existed. It does not read the other files' output, so their position
+relative to it does not matter; `12` recomputes each tag from the per-segment view, and
+each numbered file is the place the definition is *documented*.
 
 Deploy `04_code_review_template.sql` as a **view of its own** and have `05`, `06` and
 `12` join it. Editing a verdict then means editing one file, not three. The alternative
@@ -210,7 +226,7 @@ The CSV in version control is the version of record. If you also publish a sprea
 copy for people who will not run a query, say in the report that it is a snapshot and
 has to be re-imported when the query is re-run.
 
-## Issue 9 is not available here
+## Issues 9, 11 and 12 are not available here
 
 `dciodvfy` validates a Part 10 object against the Segmentation IOD. A metadata table
 is not an object, so there is no SQL form of issue 9 and `sql/12_series_triage.sql`
@@ -221,8 +237,27 @@ emits no `IOD_ERROR` / `IOD_WARNING` tag. A triage list built entirely on BigQue
 Segment Description Macro. That is a small subset of what the validator checks, and
 the report should say so where it quotes issue 4.
 
+Issues 11 and 12 are unavailable for related reasons, and both are worth stating
+explicitly rather than leaving as a gap in the summary table:
+
+- **Issue 11** needs the voxels. No metadata export carries pixel data, so nothing
+  here can tell an object that omitted its empty frames from one that kept several
+  hundred. `numberOfFrames` in the view is a claim, not a measurement — comparing it
+  against `referencedInstanceCount` hints at coverage, but an object with a frame per
+  source slice may still be almost entirely zeros.
+- **Issue 12** needs the file meta group. `TransferSyntaxUID` (0002,0010) is not part
+  of the data set a Healthcare API export flattens, so `sql/01` fills the column with
+  NULL to keep the per-segment table the same shape on all three paths. Do not read
+  that NULL as "uncompressed". If your source happens to carry the transfer syntax,
+  substitute it in `sql/01` and say so.
+
 If the objects are reachable as files anywhere — the bucket the store was loaded from,
-or a WADO-RS retrieval of a sample — run `scripts/dciodvfy_check.py` there and fold
-the result in with `seg_checks.py --iod`. Issue 10, the retired coding scheme
-designators dciodvfy also reports, *is* computable here:
-`sql/13_retired_coding_scheme.sql`.
+or a WADO-RS retrieval of a sample — run `scripts/dciodvfy_check.py` and
+`scripts/seg_encoding.py` there and fold the results in with `seg_checks.py --iod`
+and `--encoding`. Issue 10, the retired coding scheme designators dciodvfy also
+reports, *is* computable here: `sql/13_retired_coding_scheme.sql`.
+
+Issues 13 and 14 are fully available: `sql/14_recommended_color.sql` and
+`sql/15_algorithm_identification.sql`, both reading the per-segment view. The one
+part of issue 13 that is script-only is the **swatch** — rendering CIELab as sRGB for
+the report — which `seg_checks.py` writes from the same numbers.

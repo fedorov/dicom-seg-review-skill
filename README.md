@@ -7,7 +7,10 @@ It finds the defects that make a segmentation delivery unusable downstream: a se
 labelled "Large bowel" whose code denotes the liver, one code carrying five different
 meanings, a left structure coded as the right one, a segment missing attributes DICOM
 makes Type 1, an object that does not conform to the Segmentation IOD or whose
-`PixelData` is the wrong length for the frames it claims.
+`PixelData` is the wrong length for the frames it claims, two organs a viewer will
+draw in the same colour, a BINARY object that shipped a thousand all-zero frames
+uncompressed, and an AI-produced segmentation that does not say which model produced
+it.
 
 ## Install
 
@@ -35,19 +38,23 @@ path produces the **same per-segment table**, and every check runs on that.
 ```
 BigQuery metadata table ─┐
 DICOMweb store ──────────┼─> seg_attributes (one row per segment) ─┬─> report
-Directory of .dcm files ─┴─> dciodvfy (files only) ────────────────┴─> triage CSV
+Directory of .dcm files ─┤                                         │
+                         ├─> dciodvfy      (files only) ───────────┤
+                         └─> seg_encoding  (files only) ───────────┴─> triage CSV
 ```
 
-One check is not like the others: issue 9 runs `dciodvfy` against the objects
-themselves, so it is available only where the delivery is on disk. A triage list built
-from BigQuery alone is *silent* about IOD conformance, not clean.
+Three checks are not like the others. Issue 9 runs `dciodvfy` against the objects;
+issue 11 reads the pixel data to find all-zero frames; issue 12 reads the transfer
+syntax out of the file meta group. None of the three exists in a metadata export, so
+a triage list built from BigQuery alone is *silent* about IOD conformance, empty
+frames and compression — not clean.
 
 ## Layout
 
 ```
 SKILL.md                             the method: workflow, severity scale, traps
 references/
-  issue-catalogue.md                 the ten checks, with DICOM references
+  issue-catalogue.md                 the fourteen checks, with DICOM references
   terminology.md                     judging codes; SNOMED flavours; laterality
   reporting.md                       writing the report and the triage list
   access-bigquery.md                 path 1 — metadata table
@@ -57,11 +64,13 @@ scripts/
   seg_attributes.py                  extract the per-segment table (files | DICOMweb)
   seg_checks.py                      run the computed checks + triage roll-up
   dciodvfy_check.py                  validate objects against the IOD with dciodvfy
+  seg_encoding.py                    empty frames + compression, from the objects
+  cielab.py                          DICOM's CIELab: parse, compare, draw a swatch
   dcmterm.py                         check codes against the code set DICOM uses
   lookup_codes.py                    resolve codes to fully specified names
-  sql/                               the same checks as BigQuery templates, 01–13
+  sql/                               the same checks as BigQuery templates, 01–15
 tests/
-  test_seg_review.py                 67 tests over the extraction and check logic
+  test_seg_review.py                 109 tests over the extraction and check logic
 ```
 
 ## Usage
@@ -78,6 +87,9 @@ python scripts/seg_checks.py seg_attributes.csv --outdir findings/
 pip install dicom3tools
 python scripts/dciodvfy_check.py --files /path/to/delivery -o findings/
 
+#    Empty frames + compression, also files only. Measures what deflate would save.
+python scripts/seg_encoding.py --files /path/to/delivery -o findings/
+
 # 3. Coverage gap + meaning disagreements against DICOM's own code set
 python scripts/dcmterm.py coverage seg_attributes.csv -o findings/coverage.csv
 
@@ -85,22 +97,29 @@ python scripts/dcmterm.py coverage seg_attributes.csv -o findings/coverage.csv
 python scripts/lookup_codes.py seg_attributes.csv -o findings/codes.csv
 python scripts/dcmterm.py suggest findings/codes.csv -o findings/entire_flavour.csv
 
-# 5. Re-run with the IOD verdict and the curated verdicts folded in
+# 5. Re-run with the IOD and encoding verdicts and the curated verdicts folded in
 python scripts/seg_checks.py seg_attributes.csv --codes findings/codes.csv \
-    --review review.csv --iod findings/issue9_iod_validation.csv --outdir findings/
+    --review review.csv --iod findings/issue9_iod_validation.csv \
+    --encoding findings/encoding_per_object.csv --outdir findings/
 ```
 
-For BigQuery, deploy `scripts/sql/01_seg_attributes.sql` as a view and run `02`–`13`
-against it. See `references/access-bigquery.md`. Issue 9 has no SQL form.
+Step 2 also produces the display-colour palette (`issue13_color_palette.csv`, plus a
+paste-ready `.md` with an SVG swatch per row) and the algorithm-identification check,
+on every access path.
+
+For BigQuery, deploy `scripts/sql/01_seg_attributes.sql` as a view and run `02`–`15`
+against it. See `references/access-bigquery.md`. Issues 9, 11 and 12 have no SQL
+form — they need the objects.
 
 ## Dependencies
 
 | | |
 |---|---|
-| `seg_checks.py`, `lookup_codes.py` | standard library only |
+| `seg_checks.py`, `lookup_codes.py`, `cielab.py` | standard library only |
 | `dcmterm.py` | any one of `pyarrow`, `duckdb` or `pandas`, to read Parquet |
 | `seg_attributes.py --files` | `pydicom>=3.0` |
 | `dciodvfy_check.py` | `dicom3tools` (for `dciodvfy`) and `pydicom>=3.0` |
+| `seg_encoding.py` | `pydicom>=3.0`. No pixel-data codec and no numpy: frames are scanned as bytes, and Deflated Image Frame Compression is un-deflated in-process |
 | `seg_attributes.py --dicomweb` | `dicomweb-client>=0.59`, plus `[gcp]` and `google-auth` for Healthcare API stores |
 | `scripts/sql/` | the `bq` CLI |
 | `lookup_codes.py` | network access to `tx.fhir.org` (public, no auth) |
@@ -125,25 +144,31 @@ both — it answers a different question entirely.
 
 ## Verification
 
-`python tests/test_seg_review.py` — 67 tests covering extraction (Background segments,
-multi-valued code sequences, both laterality modifier sequences, absent attributes),
-the check logic (ambiguity scope classification, Type 1 conformance, TrackingUID
-sharing patterns, retired coding schemes, triage severity and ordering), the
+`python tests/test_seg_review.py` — 109 tests covering extraction (Background
+segments, multi-valued code sequences, both laterality modifier sequences, absent
+attributes), the check logic (ambiguity scope classification, Type 1 conformance,
+TrackingUID sharing patterns, retired coding schemes, triage severity and ordering),
+colour (the C.10.7.1.1 scaling, sRGB round trips against independently computed
+values, duplicate versus confusable versus same-structure, the PALETTE COLOR rule),
+algorithm identification (Type 1C only where not MANUAL, informative versus not),
+empty frames (including the mid-byte frame boundaries a byte-sliced implementation
+gets wrong, and encapsulated fragments, where the rule is the opposite), the
 terminology comparison (meaning agreement, the private-scheme and coverage-gap split,
 "Entire X" replacement matching) and the `dciodvfy -new` output parser (message
 grammar, segment and frame attribution, severity mapping). The terminology tests run
 against a stub table and the validator tests against captured output, so the suite
-needs neither network nor dicom3tools.
+needs neither network, nor dicom3tools, nor a fixture file.
 
 ## Scope
 
 DICOM SEG only. RTSTRUCT has a different structure and different failure modes.
 
-**The boundary is the voxel values.** Nothing here interprets what was segmented, so
-it will not tell you whether a segmentation is anatomically correct — only whether the
-object says what it means. Every check but issue 9 works from metadata alone; issue 9
-additionally checks that `PixelData` is the length the metadata declares, which catches
-a truncated or mis-framed object.
+**The boundary is what the voxels mean.** Nothing here interprets what was segmented,
+so it will not tell you whether a segmentation is anatomically correct — only whether
+the object says what it means. Two checks read the pixel data without needing to know
+any anatomy: issue 9 checks that `PixelData` is the length the metadata declares,
+catching a truncated or mis-framed object, and issue 11 asks only whether each frame
+is entirely zero. Everything else works from metadata alone.
 
 Structure and semantics are checked separately and neither substitutes for the other.
 `dciodvfy` decides whether the object conforms to the IOD; the terminology work decides

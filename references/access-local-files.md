@@ -6,30 +6,35 @@ pipeline before it is ingested anywhere.
 
 `scripts/seg_attributes.py --files <dir>` implements this; `pydicom` is its only
 dependency. `scripts/dciodvfy_check.py` adds the IOD validator, which needs
-`dicom3tools` as well.
+`dicom3tools` as well, and `scripts/seg_encoding.py` adds the two checks that read
+the pixel data and the file meta group.
 
 ```bash
 pip install 'pydicom>=3.0' dicom3tools
 python scripts/seg_attributes.py --files /path/to/delivery -o seg_attributes.csv
 python scripts/dciodvfy_check.py --files /path/to/delivery -o findings/
+python scripts/seg_encoding.py   --files /path/to/delivery -o findings/
 python scripts/seg_checks.py seg_attributes.csv \
-    --iod findings/issue9_iod_validation.csv --outdir findings/
+    --iod findings/issue9_iod_validation.csv \
+    --encoding findings/encoding_per_object.csv --outdir findings/
 ```
 
-**This is the only path that can run issue 9.** `dciodvfy` validates an object
-against the Segmentation IOD, and neither a BigQuery row nor a DICOMweb metadata
-response is an object. If the delivery is reachable as files at any point — before
-ingestion, or by retrieving a sample afterwards — run it here, because nothing
-downstream can.
+**This is the only path that can run issues 9, 11 and 12.** `dciodvfy` validates an
+object against the Segmentation IOD; the empty-frame check needs the voxels; the
+compression check needs `TransferSyntaxUID` (0002,0010), which lives in the file meta
+group. Neither a BigQuery row nor a DICOMweb metadata response carries any of the
+three. If the delivery is reachable as files at any point — before ingestion, or by
+retrieving a sample afterwards — run them here, because nothing downstream can.
 
 ## Reading only what is needed
 
 Two things make this fast enough to run over a whole delivery:
 
 - **`stop_before_pixels=True`.** A segmentation's metadata is kilobytes; its pixel data
-  can be hundreds of megabytes, and the extraction interprets no voxel. (`dciodvfy`
-  does read `PixelData`, to check its length — see issue 9. That is a separate pass
-  over the files and it cannot be made cheaper.)
+  can be hundreds of megabytes, and the extraction interprets no voxel. Two separate
+  passes do read it, and neither can be made cheaper: `dciodvfy` checks `PixelData`'s
+  length against the declared geometry (issue 9), and `seg_encoding.py` tests each
+  frame for emptiness (issue 11). Run them as their own step, not inside the extract.
 - **`specific_tags`** is *not* used, deliberately. It does not descend into sequences,
   so it cannot fetch `SegmentSequence` selectively, and the saving over
   `stop_before_pixels` alone is negligible.
@@ -91,6 +96,43 @@ any that failed to validate at all).
 Read the printed `IOD validated against:` line. It should be `Segmentation` for every
 object; anything else means dciodvfy applied different rules to part of the batch and
 nothing below it can be quoted until that is explained.
+
+## Empty frames and compression
+
+`scripts/seg_encoding.py` is the second pass over the files, and the only one that
+looks at the voxels for their own sake. Detail and the DICOM references are in
+`references/issue-catalogue.md`, issues 11 and 12; the essentials for this path:
+
+- **It needs no pixel-data codec and no numpy.** A frame is empty when every bit of
+  its range is zero, which is an integer mask over a slice of `PixelData`. Native
+  encodings are read directly; Deflated Image Frame Compression
+  (`1.2.840.10008.1.2.8.1`) is un-deflated here, fragment by fragment, because
+  pydicom 3.0.1 does not recognise that UID at all. RLE and the JPEG family are
+  reported as `NOT_DECODED` rather than guessed at — read the decode-status counts
+  before quoting an empty-frame number as complete.
+- **`--workers` parallelises across files**, `--limit N` scans a sample first.
+- Pass `--viewer-url` here too, with the same pattern used for the extract.
+
+Four CSVs come out: `encoding_per_object.csv` (the join contract, one row per
+object), `issue11_empty_frames.csv` (objects that kept all-zero frames, worst first),
+`issue11_empty_segments.csv` (segments with no voxels anywhere) and
+`issue12_compression.csv` (one row per transfer syntax, with the **measured** deflated
+size beside the delivered one — that number is the argument a producer can act on).
+
+Read the printed decode-status block. An object whose pixel data could not be read is
+not an object with no empty frames.
+
+## Colour and algorithm identification
+
+Issues 13 and 14 need nothing extra here: `seg_attributes.py` extracts
+`RecommendedDisplayCIELabValue`, `SegmentAlgorithmName` and the whole
+`SegmentationAlgorithmIdentificationSequence`, and `seg_checks.py` runs both checks on
+every invocation. They run identically on all three access paths.
+
+The one local-files detail: `PhotometricInterpretation` is extracted because issue 13
+needs it. PS3.3 C.8.20.2 forbids `RecommendedDisplayCIELabValue` on a LABELMAP object
+whose Photometric Interpretation is PALETTE COLOR, and that rule cannot be evaluated
+without it.
 
 ## What is missing compared to the other paths
 

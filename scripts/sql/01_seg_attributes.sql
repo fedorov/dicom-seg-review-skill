@@ -35,7 +35,14 @@
 # NULL column. Delete the columns your source lacks - and report each absence,
 # because it means no instance in the batch uses that attribute. Absent in real
 # batches: TrackingID / TrackingUID, AnatomicRegionModifierSequence,
-# SegmentAlgorithmName, SegmentedPropertyTypeModifierCodeSequence.
+# SegmentAlgorithmName, SegmentedPropertyTypeModifierCodeSequence,
+# SegmentationAlgorithmIdentificationSequence, RecommendedDisplayCIELabValue.
+#
+# Two columns this view CANNOT fill, on any BigQuery source: TransferSyntaxUID
+# (file meta, which an export drops) and anything about the pixel data. Issues
+# 11 and 12 are therefore unavailable here, exactly as issue 9 is - run
+# scripts/seg_encoding.py over the files, or say in the report that the
+# encoding was not reviewed.
 #
 # The code sequences are taken at SAFE_OFFSET(0). `multiValuedCodeSequence` is
 # the guard that says so, and is the one derived column here because it protects
@@ -58,6 +65,7 @@ WITH
       FrameOfReferenceUID,
       SegmentationType,
       SegmentsOverlap,
+      PhotometricInterpretation,
       Manufacturer,
       ManufacturerModelName,
       SoftwareVersions,
@@ -260,6 +268,84 @@ SELECT
   segment.SegmentAlgorithmName[SAFE_OFFSET(0)] AS SegmentAlgorithmName,
 
   # description:
+  # TRUE when this segment carries a Segmentation Algorithm Identification
+  # Sequence (0062,0007). Type 3, and the only standard home for the algorithm
+  # VERSION - see 15_algorithm_identification.sql.
+  # DELETE THIS COLUMN, and the five below, if the source schema lacks the
+  # sequence - and report the absence: it means no instance identifies the
+  # algorithm that produced it beyond a bare name.
+  ARRAY_LENGTH(segment.SegmentationAlgorithmIdentificationSequence) > 0
+    AS hasAlgorithmIdentification,
+
+  # description:
+  # Algorithm Name (0066,0036) within (0062,0007). Type 1 within the sequence.
+  segment.SegmentationAlgorithmIdentificationSequence[SAFE_OFFSET(0)]
+    .AlgorithmName AS AlgorithmName,
+
+  # description:
+  # Algorithm Version (0066,0031) within (0062,0007). Type 1 within the
+  # sequence, and the only place a model's version can be recorded.
+  segment.SegmentationAlgorithmIdentificationSequence[SAFE_OFFSET(0)]
+    .AlgorithmVersion AS AlgorithmVersion,
+
+  # description:
+  # Algorithm Source (0024,0202) within (0062,0007): who produced the model
+  segment.SegmentationAlgorithmIdentificationSequence[SAFE_OFFSET(0)]
+    .AlgorithmSource AS AlgorithmSource,
+
+  # description:
+  # CodeValue of AlgorithmFamilyCodeSequence (0066,002F), baseline CID 7162
+  segment.SegmentationAlgorithmIdentificationSequence[SAFE_OFFSET(0)]
+    .AlgorithmFamilyCodeSequence[SAFE_OFFSET(0)].CodeValue
+    AS AlgorithmFamilyCodeValue,
+
+  # description:
+  # CodingSchemeDesignator of AlgorithmFamilyCodeSequence
+  segment.SegmentationAlgorithmIdentificationSequence[SAFE_OFFSET(0)]
+    .AlgorithmFamilyCodeSequence[SAFE_OFFSET(0)].CodingSchemeDesignator
+    AS AlgorithmFamilyCodingSchemeDesignator,
+
+  # description:
+  # CodeMeaning of AlgorithmFamilyCodeSequence
+  segment.SegmentationAlgorithmIdentificationSequence[SAFE_OFFSET(0)]
+    .AlgorithmFamilyCodeSequence[SAFE_OFFSET(0)].CodeMeaning
+    AS AlgorithmFamilyCodeMeaning,
+
+  # description:
+  # CodeValue of AlgorithmNameCodeSequence (0066,0030) - the manufacturer's
+  # code for a SPECIFIC algorithm, i.e. the closest DICOM has to a model
+  # identifier. Type 3 and rare; its absence is the usual finding.
+  segment.SegmentationAlgorithmIdentificationSequence[SAFE_OFFSET(0)]
+    .AlgorithmNameCodeSequence[SAFE_OFFSET(0)].CodeValue
+    AS AlgorithmNameCodeValue,
+
+  # description:
+  # CodingSchemeDesignator of AlgorithmNameCodeSequence
+  segment.SegmentationAlgorithmIdentificationSequence[SAFE_OFFSET(0)]
+    .AlgorithmNameCodeSequence[SAFE_OFFSET(0)].CodingSchemeDesignator
+    AS AlgorithmNameCodingSchemeDesignator,
+
+  # description:
+  # CodeMeaning of AlgorithmNameCodeSequence
+  segment.SegmentationAlgorithmIdentificationSequence[SAFE_OFFSET(0)]
+    .AlgorithmNameCodeSequence[SAFE_OFFSET(0)].CodeMeaning
+    AS AlgorithmNameCodeMeaning,
+
+  # description:
+  # RecommendedDisplayCIELabValue (0062,000D) as "L/a/b", the three unsigned
+  # shorts exactly as stored - scaled per PS3.3 C.10.7.1.1, NOT RGB. Rendering
+  # it needs a white point the Standard only implies, so the conversion lives
+  # with the check (scripts/cielab.py) rather than here, where it would look
+  # like data. See 14_recommended_color.sql.
+  # DELETE THIS COLUMN if the source schema lacks it - and report the absence:
+  # it means no segment in the batch recommends a colour.
+  ARRAY_TO_STRING(
+    ARRAY(
+      SELECT CAST(component AS STRING)
+      FROM UNNEST(segment.RecommendedDisplayCIELabValue) AS component),
+    '/') AS RecommendedDisplayCIELabValue,
+
+  # description:
   # DICOM SegmentationType (0062,0001): BINARY, FRACTIONAL or LABELMAP
   segInstances.SegmentationType,
 
@@ -267,6 +353,22 @@ SELECT
   # DICOM SegmentsOverlap (0062,0013). Type 3, so often absent - see
   # 10_segments_overlap_absent.sql.
   segInstances.SegmentsOverlap,
+
+  # description:
+  # DICOM PhotometricInterpretation (0028,0004). Needed by
+  # 14_recommended_color.sql: (0062,000D) shall NOT be present when a LABELMAP
+  # object is PALETTE COLOR.
+  segInstances.PhotometricInterpretation,
+
+  # description:
+  # DICOM TransferSyntaxUID (0002,0010). NULL here on purpose: it lives in the
+  # file meta group, which a Healthcare API export does not carry, so issue 12
+  # cannot be answered from BigQuery at all. The column is kept so the
+  # per-segment table is the same shape on all three access paths; if your
+  # source does carry the transfer syntax, substitute it here. Otherwise run
+  # scripts/seg_encoding.py over the files and say in the report that
+  # compression was not checked on this path.
+  CAST(NULL AS STRING) AS TransferSyntaxUID,
 
   # description:
   # DICOM Manufacturer of the producing software

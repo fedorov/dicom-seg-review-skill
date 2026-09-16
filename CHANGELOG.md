@@ -1,5 +1,75 @@
 # Changelog
 
+## 1.3.0 — 2026-09-16
+
+Four checks about how a delivery is *encoded* and *presented*, rather than coded.
+
+- **Issue 11 — empty frames, and segments with no voxels.** `scripts/seg_encoding.py`
+  reads the pixel data and reports the all-zero frames a BINARY object kept, with the
+  fraction and the bytes they cost. Omitting them is what `dcmqi` and `highdicom` do
+  by default and nothing in PS3.3 requires it, so this is Low and the *measurement* is
+  the argument. A segment whose every frame is empty is Medium and a different
+  finding: the object declares an annotation that is not there. PS3.3 C.8.20.2.3.3
+  permits it for LABELMAP explicitly — "despite the inefficiency of encoding unused
+  information".
+- **The bit-packing trap, which makes a naive version wrong.** PS3.5 §8.1: with
+  `BitsAllocated` 1 in Native Format "the individual Frames are not padded... a frame
+  other than the first frame may start in the middle of a byte". Slicing `PixelData`
+  at byte boundaries reads a neighbour's pixels, so an empty frame whose predecessor
+  ended mid-byte reads as full. The check masks a bit range instead — and does the
+  opposite for encapsulated frames, which *are* byte-aligned, one per fragment
+  (PS3.5 A.4.13). Both directions are pinned by tests.
+- **Issue 12 — compression.** The transfer syntax distribution, and what deflate would
+  actually have saved, **measured** on each object's own pixel data rather than
+  asserted. Two deflates exist and are not the same: Deflated Explicit VR Little
+  Endian (`1.2.840.10008.1.2.1.99`, the whole Data Set) and Deflated Image Frame
+  Compression (`1.2.840.10008.1.2.8.1`, per frame), the latter named by PS3.5 §8.2.16
+  as intended for exactly these bilevel objects. Recommending it has a cost worth
+  stating: pydicom 3.0.1 does not know that UID at all, so `seg_encoding.py` splits
+  the fragments and inflates them itself.
+- **Lossy compression is the one High finding here** — PS3.3 C.8.20.2.2, "BINARY or
+  LABELMAP Segmentation Instances should not be lossy compressed" — and the verdict
+  comes from the **transfer syntax**, never from `LossyImageCompression` (0028,2110),
+  which the same section requires to be `01` when the *source images* were lossy.
+  Reading it the other way manufactures a High finding out of a correct object.
+- **Issue 13 — the recommended display colour.** What colours a delivery assigns, and
+  where two *different* structures in one object share one, which is what makes a
+  viewer draw two organs identically. Also the absent, the malformed, the
+  not-permitted (PS3.3 C.8.20.2 forbids it on a PALETTE COLOR LABELMAP) and the
+  inconsistent — one structure drawn several ways across the batch.
+- **Decided in CIELab, rendered only for humans.** `scripts/cielab.py` implements the
+  PS3.3 C.10.7.1.1 scaling, ΔE\*ab, and the sRGB conversion that inverts PixelMed's
+  (D50, the ICC PCS, which is what dcmqi follows). The findings depend on the scaling
+  alone, so they are exact; a swatch is the producer's intent. `--color-delta-e`
+  defaults to 10 because 2.3 — the classic JND — is for large flat patches, not small
+  scattered overlays at partial opacity.
+- **Colour previews in the Markdown report.** `seg_checks.py` writes
+  `issue13_color_palette.md` with an SVG swatch per row, plus the swatch files. An SVG
+  referenced relatively is the one approach that renders everywhere: GitHub strips
+  `style`, refuses `data:` image sources, and supports its `#RRGGBB` chips only in
+  issues and pull requests, not in committed Markdown. The hex is always printed as
+  text beside it, for the same reason a UID is printed beside its link.
+- **Issue 14 — an automatic segmentation that does not say what made it.**
+  `SegmentAlgorithmName` (0062,0009) is **Type 1C**, "Required if Segment Algorithm
+  Type is not MANUAL", so its absence there is a conformance violation (Medium). The
+  missing *version* beside it is not: that lives in
+  `SegmentationAlgorithmIdentificationSequence` (0062,0007), Type 3, which carries the
+  Algorithm Identification Macro (PS3.3 Table 10-19) — name, version, source, and
+  `AlgorithmNameCodeSequence`, the closest DICOM has to a model identifier. Low, and
+  still the reason nobody can say which model version produced a delivery.
+  `ManufacturerModelName` is not a substitute; on a converted segmentation it names
+  the converter. It is a cross-check instead.
+- **Thirteen columns added to the per-segment table**, identically on all three access
+  paths, plus `sql/14_recommended_color.sql` and `sql/15_algorithm_identification.sql`
+  and the new tags in `sql/12`. Issues 13 and 14 run everywhere; issues 11 and 12
+  join issue 9 as objects-only, and every reference now says which of the six tags a
+  given path cannot produce — silence in a triage CSV looks the same whether a check
+  passed or never ran.
+- 31 more tests, including the mid-byte frame boundary, the encapsulated opposite, the
+  sRGB round trip against independently computed values, and same-structure colour
+  sharing *not* being a finding. The suite still needs no network, no dicom3tools and
+  no fixture files.
+
 ## 1.2.0 — 2026-09-15
 
 The review now validates the objects, not only their metadata table.

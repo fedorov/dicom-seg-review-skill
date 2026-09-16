@@ -1,7 +1,7 @@
 # Issue catalogue
 
-The ten checks. Each gives what the defect is, why it matters, how to detect it, and
-what the finding looks like in practice.
+The fourteen checks. Each gives what the defect is, why it matters, how to detect
+it, and what the finding looks like in practice.
 
 Numbering is stable. Add new issues with the next free number; do not renumber, since
 reports cite these.
@@ -147,7 +147,13 @@ value alone does not identify a concept.
 
 `AnatomicRegionSequence` and `RecommendedDisplayCIELabValue` are optional; their
 absence is conformant and must **not** be reported here. `TrackingID`/`TrackingUID` are
-Type 1C.
+Type 1C. (Issue 13 does report a missing recommended colour, as a Low, for a different
+reason: not that it is required, but that every consumer then invents one. Keep the two
+apart — this check is about conformance.)
+
+**`SegmentAlgorithmName` (0062,0009) is Type 1C, not Type 1**, so it belongs to
+issue 14 rather than here: it is required only where `SegmentAlgorithmType` is not
+MANUAL.
 
 These are usually few and badly broken — a segment empty but for a single code value
 with no scheme designator breaks four Type 1 attributes and supplies the fifth
@@ -440,3 +446,235 @@ Two things belong in that paragraph beside the counts:
   review. Lumping the two together overstates the problem.
 
 See "The coverage trap" in `SKILL.md` and `references/terminology.md`.
+
+---
+
+## 11. Empty frames kept, and segments with no voxels
+
+**Severity: Low** for retained empty frames, **Medium** for a segment that holds
+nothing at all. **Layer: computed, but only where the files are on disk.**
+
+A BINARY segmentation carries one frame per segment per slice, and on a typical
+lesion most of those slices contain nothing. Those all-zero frames are pure
+overhead: for a 512 × 512 object each costs 32 KiB uncompressed, and a
+whole-body series can be 90% empty. The preference — near-universal in the
+tooling, and what `dcmqi` and `highdicom` (`omit_empty_frames`) do by default —
+is to **omit them**, since a frame's position comes from its own Plane Position
+(Patient) and its segment from its own `SegmentIdentificationSequence`. Nothing
+requires a frame per source image.
+
+**Say plainly that keeping them is conformant.** No text in PS3.3 C.8.20
+requires omission, so this is an efficiency argument, not a violation — which is
+exactly why it is Low and why the *scale* is the part worth reporting. Give the
+fraction of frames that are empty and the bytes they occupy, and the case makes
+itself.
+
+**A segment with no voxels anywhere is a different finding**, and Medium: the
+object declares a segment, names its anatomy, and then segments nothing. A
+consumer counting findings counts one that does not exist. PS3.3 C.8.20.2.3.3
+permits it explicitly for LABELMAP — "the Segment Sequence can describe Segments
+that are not actually present in the pixel data, e.g., to allow for re-use of a
+common Segment description across multiple instances, despite the inefficiency
+of encoding unused information" — so report it as what it is: permitted, and
+almost never what was meant.
+
+**Detection.** `scripts/seg_encoding.py --files <dir>`. Frames are scanned as
+bytes, not decoded into an array, so a whole delivery is affordable.
+
+### The trap that makes a hand-rolled version wrong
+
+**BINARY frames are not byte-aligned.** PS3.5 §8.1: "In a Multi-frame Image with
+a Bits Allocated (0028,0100) of 1 that is transmitted in Native Format, the
+individual Frames are not padded, therefore successive bits are packed into
+bytes or words... I.e., a frame other than the first frame may start in the
+middle of a byte or word."
+
+So for `Rows × Columns` not a multiple of 8, slicing `PixelData` at
+`frame * rows * columns / 8` reads a neighbour's pixels, and an empty frame
+whose predecessor ended mid-byte reads as non-empty. The check must mask a bit
+range, not slice a byte range. `frame_is_empty` does; `payload_is_empty` handles
+the opposite case, since an **encapsulated** frame is its own fragment and *does*
+start on a byte boundary (PS3.5 A.4.13).
+
+Two more:
+
+- **`NumberOfFrames` is a claim, not a measurement.** Scan what the pixel data
+  actually holds and report the disagreement (`SHORT_PIXEL_DATA`) rather than
+  iterating to a frame that is not there. dciodvfy reports the same thing from
+  the other direction, as `BAD_VALUE_LENGTH` — issue 9.
+- **An empty *segment* on a LABELMAP object is a question about values, not
+  frames.** One frame carries every segment, so "segment 3 is empty" means the
+  value 3 appears nowhere in the pixel data.
+
+---
+
+## 12. Compression: none, the wrong kind, or lossy
+
+**Severity: Low** where an object is uncompressed, **High** where it is lossy
+compressed. **Layer: computed, from the file meta group — files on disk only.**
+
+Segmentation pixel data is the most compressible data in DICOM: long runs of
+zeros, one bit per pixel. Deflate routinely takes 90% or more off it, and the
+Standard offers two ways to apply it, which are **not** the same thing:
+
+| Transfer Syntax | UID | What it compresses |
+|---|---|---|
+| Deflated Explicit VR Little Endian | `1.2.840.10008.1.2.1.99` | the **entire Data Set**, as one stream (PS3.5 A.5) |
+| Deflated Image Frame Compression | `1.2.840.10008.1.2.8.1` | **each frame**, into its own encapsulated fragment (PS3.5 A.4.13) |
+
+The second is the one the Standard designed for these objects. PS3.5 §8.2.16:
+"One application of Deflated Image Frame Compression is the lossless compression
+of single bit (bilevel, Bits Allocated (0028,0100) == 1) Segmentation images."
+It also keeps the metadata readable without inflating anything, and lets a
+consumer fetch one frame.
+
+**Report the transfer syntax distribution and the measured saving**, not a
+recommendation. `seg_encoding.py` deflates each object's pixel data and records
+what it would have cost — an argument a producer can act on, where "you should
+compress" is not. Quote it as the optimistic end of the range: compressing the
+whole stream at once beats compressing frames separately.
+
+**The cost of recommending `1.2.840.10008.1.2.8.1` is real, so state it.**
+pydicom 3.0.1 does not know the UID at all — `UID.is_encapsulated` raises "UID is
+not a transfer syntax" and `dcmwrite` refuses it — though `dcmread` still parses
+such a file by falling back to Explicit VR Little Endian. Check what the
+consumers of this delivery can actually read before telling a producer to switch;
+`1.2.840.10008.1.2.1.99` is older and more widely supported, and for a
+segmentation its pixel data compresses nearly as well.
+
+### Lossy compression is the High finding
+
+PS3.3 C.8.20.2.2: "It is not advisable to lossy compress a Segmentation
+Instance. In particular, BINARY or LABELMAP Segmentation Instances should not be
+lossy compressed." A lossy-compressed segmentation has voxel values that are not
+the ones that were segmented, the object does not say which moved, and no
+consumer can recover them. That is the definition of High in this skill.
+
+**Do not read `LossyImageCompression` (0028,2110) as "this object was lossy
+compressed".** The same section requires it to be `01` when any of the **source
+images** was lossy compressed — so a perfectly intact segmentation of a lossy
+JPEG CT carries `01`. Take the verdict from the **transfer syntax**, and keep
+(0028,2110) beside it as context. Reading it the other way manufactures a High
+finding out of a correct object.
+
+### Why this cannot run on the other access paths
+
+The Transfer Syntax UID lives in the file meta group (0002,0010), which a Google
+Healthcare API BigQuery export does not carry and a DICOMweb metadata response
+does not return. `sql/01` keeps the column and fills it with NULL so the
+per-segment table is the same shape everywhere — which means a BigQuery-based
+review is **silent** about issues 11 and 12, exactly as it is about issue 9. Say
+so.
+
+---
+
+## 13. Recommended display colour: absent, duplicated, or indistinguishable
+
+**Severity: Medium** where two structures in one object share a colour,
+**Low** otherwise. **Layer: computed.**
+
+`RecommendedDisplayCIELabValue` (0062,000D) is how a segmentation tells a viewer
+what colour to draw each segment. It is Type 3, three unsigned shorts, scaled per
+**PS3.3 C.10.7.1.1**:
+
+```
+L*     0x0000 -> 0.0     0xFFFF -> 100.0
+a*, b* 0x0000 -> -128.0  0x8080 -> 0.0    0xFFFF -> 127.0
+```
+
+Six things are worth deciding, and only the first two need a human to care:
+
+| `colorIssue` | Severity | Meaning |
+|---|---|---|
+| `DUPLICATE_IN_OBJECT` | Medium | Two segments of **different** structures in one object, same colour. The viewer draws both overlays identically. |
+| `CONFUSABLE_IN_OBJECT` | Low | ... or within the ΔE\*ab threshold of each other. |
+| `NOT_PERMITTED` | Medium | Present on a LABELMAP object whose Photometric Interpretation is PALETTE COLOR. PS3.3 C.8.20.2: it "shall not be present". |
+| `MALFORMED` | Medium | Present, but not three unsigned shorts. A VM violation. |
+| `INCONSISTENT_ACROSS_BATCH` | Low | One structure drawn in several colours across the delivery. Not wrong anywhere in particular; two series cannot be read side by side. |
+| `ABSENT` | Low | No colour. Type 3, so conformant — but every consumer then invents one, and two consumers invent different ones. |
+
+**Two segments of the same structure sharing a colour is the point of a colour
+convention, not a defect.** The check compares structures — the type code and the
+anatomic region code, falling back to the label only where neither exists — so
+consistency is never reported as duplication. Get this wrong and the finding is
+every multi-object delivery in existence.
+
+**Decide in CIELab; convert to RGB only to show a human.** ΔE\*ab (CIE76) is a
+plain Euclidean distance once the components are unscaled, and it depends on
+nothing but C.10.7.1.1, so "these two are the same colour" is exact. Rendering
+one as sRGB needs a white point the Standard only implies: the note says the
+encoding is "the same form ... as used for the PCS in ICC Profiles", the ICC PCS
+is D50, and PixelMed's `ColorUtilities` — which `dcmqi` follows — converts sRGB
+(D65) → XYZ → D50 → Lab on the way in. `scripts/cielab.py` inverts exactly that.
+Writers differ at the margins, so a swatch is the producer's intent, not
+evidence.
+
+**The threshold is a judgement; `--color-delta-e` exists so it can be argued
+with.** 2.3 ΔE\*ab is the classic just-noticeable difference for two large flat
+patches side by side. Segment overlays are small, scattered, and drawn at partial
+opacity over grey, so the threshold that matters in a viewer is well above that;
+the default is 10. Say which value you used.
+
+**Publish the palette even when nothing is wrong.** `issue13_color_palette.csv`
+is one row per distinct colour with the structures using it — it answers "what
+colours does this delivery assign", which is a question a reader has before any
+finding. `seg_checks.py` also writes it as Markdown with a swatch per row; see
+`references/reporting.md`.
+
+---
+
+## 14. An automatic segmentation that does not say what made it
+
+**Severity: Medium** for the conformance violation, **Low** for the rest.
+**Layer: computed.**
+
+`SegmentAlgorithmName` (0062,0009) is **Type 1C** in the Segmentation Image
+Module: *"Required if Segment Algorithm Type (0062,0008) is not MANUAL"*
+(PS3.3 C.8.20.2). An `AUTOMATIC` or `SEMIAUTOMATIC` segment with no algorithm
+name is non-conformant, full stop — that is `NAME_MISSING`, and it is the only
+one of the four reasons below that is a violation.
+
+The other three are about whether the name is worth anything:
+
+| Reason | What it means |
+|---|---|
+| `NAME_MISSING` | (0062,0009) absent on a non-MANUAL segment. **Type 1C violation.** |
+| `NAME_UNINFORMATIVE` | A name that identifies nothing: "unknown", "AI", "segmentation" — or the name of the toolkit that *wrote* the object rather than the model that segmented it. |
+| `NO_IDENTIFICATION` | No `SegmentationAlgorithmIdentificationSequence` (0062,0007), so no version, no source, no coded model identity. |
+| `NO_VERSION` | (0062,0007) present, but `AlgorithmVersion` (0066,0031) — Type 1 *within* it — is empty. |
+
+### Where the model belongs
+
+(0062,0009) is a bare string with nowhere to put a version. The structured home
+is **`SegmentationAlgorithmIdentificationSequence` (0062,0007)**, Type 3, which
+includes the Algorithm Identification Macro (**PS3.3 Table 10-19**):
+
+| Attribute | Tag | Type | Carries |
+|---|---|---|---|
+| `AlgorithmFamilyCodeSequence` | (0066,002F) | 1 | what kind of algorithm, baseline CID 7162 |
+| `AlgorithmName` | (0066,0036) | 1 | the model's name |
+| `AlgorithmVersion` | (0066,0031) | 1 | **which version produced these annotations** |
+| `AlgorithmNameCodeSequence` | (0066,0030) | 3 | a manufacturer's code for a specific algorithm — the closest DICOM has to a model identifier |
+| `AlgorithmSource` | (0024,0202) | 3 | who produced it |
+| `AlgorithmParameters` | (0066,0033) | 3 | how it was configured |
+
+PS3.3 notes that (0062,0007) replaced the older
+`SegmentSurfaceGenerationAlgorithmIdentificationSequence` (0066,002D) in this
+module, "since not all segmentation algorithms involve surface generation" — so a
+producer emitting the retired one is aiming at the wrong attribute.
+
+Being Type 3, its absence is conformant, which is why `NO_IDENTIFICATION` is Low.
+Say in the report what it costs anyway: **a delivery without it cannot be
+attributed to a model version**, so "which model produced these annotations, and
+were they re-run after the fix" has no answer inside the data.
+
+### Manufacturer is not a substitute — it is a cross-check
+
+`Manufacturer` (0008,0070), `ManufacturerModelName` (0008,1090) and
+`SoftwareVersions` (0018,1020) describe the equipment that **wrote the object**,
+which on a converted segmentation is `dcmqi` or `highdicom`, not the model. The
+per-segment table carries them beside the algorithm columns for one reason: the
+disagreement is informative. A batch whose `ManufacturerModelName` is an
+inference toolkit while every `SegmentAlgorithmType` says `MANUAL` is
+misdescribing how it was made, and that belongs in the report even though no
+query returns it.

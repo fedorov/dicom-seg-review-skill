@@ -11,6 +11,9 @@
 #
 # Fill entireFlavourCodes and cosmeticCodes below from 07_entire_code_flavour.sql
 # and from your reading of 02_ambiguous_code.sql. Everything else is computed.
+#
+# @@DELTA_E@@ is issue 13's confusability threshold in dE*ab; use the same value
+# here as in 14_recommended_color.sql, or the two will disagree.
 
 WITH
   review AS (
@@ -88,6 +91,60 @@ WITH
     HAVING COUNT(DISTINCT PatientID) > 1
   ),
 
+  # Issue 13. Two segments of DIFFERENT structures in ONE object, close enough
+  # in CIELab that a viewer draws them alike. Definitions and the dE*ab scaling
+  # are in 14_recommended_color.sql; @@DELTA_E@@ is the same threshold.
+  colouredSegments AS (
+    SELECT
+      SOPInstanceUID,
+      SegmentNumber,
+      RecommendedDisplayCIELabValue,
+      SAFE_CAST(SPLIT(RecommendedDisplayCIELabValue, '/')[SAFE_OFFSET(0)]
+                AS FLOAT64) / 65535.0 * 100.0 AS Lstar,
+      SAFE_CAST(SPLIT(RecommendedDisplayCIELabValue, '/')[SAFE_OFFSET(1)]
+                AS FLOAT64) / 65535.0 * 255.0 - 128.0 AS astar,
+      SAFE_CAST(SPLIT(RecommendedDisplayCIELabValue, '/')[SAFE_OFFSET(2)]
+                AS FLOAT64) / 65535.0 * 255.0 - 128.0 AS bstar,
+      # Must match 14_recommended_color.sql exactly, designators included, or
+      # the two disagree about what counts as "a different structure".
+      IF(SegmentedPropertyTypeCodeValue IS NOT NULL
+           OR AnatomicRegionCodeValue IS NOT NULL,
+         CONCAT(IFNULL(SegmentedPropertyTypeCodingSchemeDesignator, ''), ':',
+                IFNULL(SegmentedPropertyTypeCodeValue, ''), '|',
+                IFNULL(AnatomicRegionCodingSchemeDesignator, ''), ':',
+                IFNULL(AnatomicRegionCodeValue, '')),
+         CONCAT('label:', IFNULL(SegmentLabel, ''))) AS structureKey
+    FROM `@@SEG_ATTRIBUTES@@`
+    WHERE RecommendedDisplayCIELabValue IS NOT NULL AND NOT isBackgroundSegment
+  ),
+
+  colourCollisions AS (
+    SELECT
+      a.SOPInstanceUID,
+      a.SegmentNumber,
+      LOGICAL_OR(a.RecommendedDisplayCIELabValue
+                 = b.RecommendedDisplayCIELabValue) AS isDuplicate
+    FROM colouredSegments AS a
+    JOIN colouredSegments AS b
+      ON a.SOPInstanceUID = b.SOPInstanceUID
+      AND a.SegmentNumber != b.SegmentNumber
+      AND a.structureKey != b.structureKey
+    WHERE
+      a.Lstar IS NOT NULL AND b.Lstar IS NOT NULL
+      AND SQRT(POW(a.Lstar - b.Lstar, 2)
+               + POW(a.astar - b.astar, 2)
+               + POW(a.bstar - b.bstar, 2)) < @@DELTA_E@@
+    GROUP BY a.SOPInstanceUID, a.SegmentNumber
+  ),
+
+  # Issue 13. One structure drawn in several colours across the batch.
+  inconsistentStructures AS (
+    SELECT structureKey
+    FROM colouredSegments
+    GROUP BY structureKey
+    HAVING COUNT(DISTINCT RecommendedDisplayCIELabValue) > 1
+  ),
+
   flagged AS (
     SELECT
       seg.*,
@@ -142,11 +199,53 @@ WITH
         AS isCosmetic,
       seg.SegmentedPropertyTypeCodeValue = seg.SegmentedPropertyCategoryCodeValue
         AS isTypeRepeatsCategory,
-      seg.SegmentsOverlap IS NULL AS isNoSegmentsOverlap
+      seg.SegmentsOverlap IS NULL AS isNoSegmentsOverlap,
+      # Issue 13. See 14_recommended_color.sql for every definition here.
+      IFNULL(colourCollisions.isDuplicate, FALSE) AS isColorDuplicate,
+      # A collision that is not an exact duplicate. NULL means no collision.
+      IFNULL(NOT colourCollisions.isDuplicate, FALSE) AS isColorConfusable,
+      IF(seg.SegmentedPropertyTypeCodeValue IS NOT NULL
+           OR seg.AnatomicRegionCodeValue IS NOT NULL,
+         CONCAT(IFNULL(seg.SegmentedPropertyTypeCodingSchemeDesignator, ''), ':',
+                IFNULL(seg.SegmentedPropertyTypeCodeValue, ''), '|',
+                IFNULL(seg.AnatomicRegionCodingSchemeDesignator, ''), ':',
+                IFNULL(seg.AnatomicRegionCodeValue, '')),
+         CONCAT('label:', IFNULL(seg.SegmentLabel, '')))
+        IN (SELECT structureKey FROM inconsistentStructures)
+        AS isColorInconsistent,
+      # PS3.3 C.8.20.2: shall not be present on a PALETTE COLOR LABELMAP.
+      seg.RecommendedDisplayCIELabValue IS NOT NULL
+        AND seg.SegmentationType = 'LABELMAP'
+        AND seg.PhotometricInterpretation = 'PALETTE COLOR'
+        AS isColorNotPermitted,
+      # VM 3, so anything else is malformed - including a fourth component,
+      # which is why the length is checked and not just the casts.
+      seg.RecommendedDisplayCIELabValue IS NOT NULL
+        AND (ARRAY_LENGTH(SPLIT(seg.RecommendedDisplayCIELabValue, '/')) != 3
+             OR SAFE_CAST(SPLIT(seg.RecommendedDisplayCIELabValue, '/')[SAFE_OFFSET(0)]
+                          AS FLOAT64) IS NULL
+             OR SAFE_CAST(SPLIT(seg.RecommendedDisplayCIELabValue, '/')[SAFE_OFFSET(1)]
+                          AS FLOAT64) IS NULL
+             OR SAFE_CAST(SPLIT(seg.RecommendedDisplayCIELabValue, '/')[SAFE_OFFSET(2)]
+                          AS FLOAT64) IS NULL) AS isColorMalformed,
+      seg.RecommendedDisplayCIELabValue IS NULL AS isColorAbsent,
+      # Issue 14. Type 1C, so this one is a conformance violation; the rest of
+      # 15_algorithm_identification.sql is about what the name is worth.
+      UPPER(IFNULL(seg.SegmentAlgorithmType, '')) IN ('AUTOMATIC', 'SEMIAUTOMATIC')
+        AND (seg.SegmentAlgorithmName IS NULL
+             OR TRIM(seg.SegmentAlgorithmName) = '') AS isAlgorithmNameMissing,
+      UPPER(IFNULL(seg.SegmentAlgorithmType, '')) IN ('AUTOMATIC', 'SEMIAUTOMATIC')
+        AND (NOT IFNULL(seg.hasAlgorithmIdentification, FALSE)
+             OR seg.AlgorithmVersion IS NULL
+             OR TRIM(seg.AlgorithmVersion) = '') AS isAlgorithmUnidentified
     FROM
       `@@SEG_ATTRIBUTES@@` AS seg
     LEFT JOIN
       dominantMeaning ON dominantMeaning.code = seg.AnatomicRegionCodeValue
+    LEFT JOIN
+      colourCollisions
+      ON colourCollisions.SOPInstanceUID = seg.SOPInstanceUID
+      AND colourCollisions.SegmentNumber = seg.SegmentNumber
     WHERE
       NOT seg.isBackgroundSegment
   ),
@@ -174,6 +273,14 @@ WITH
       COUNTIF(isCosmetic) AS nCosmetic,
       COUNTIF(isTypeRepeatsCategory) AS nTypeRepeatsCategory,
       LOGICAL_OR(isNoSegmentsOverlap) AS anyNoSegmentsOverlap,
+      COUNTIF(isColorDuplicate) AS nColorDuplicate,
+      COUNTIF(isColorConfusable) AS nColorConfusable,
+      COUNTIF(isColorInconsistent) AS nColorInconsistent,
+      COUNTIF(isColorNotPermitted) AS nColorNotPermitted,
+      COUNTIF(isColorMalformed) AS nColorMalformed,
+      COUNTIF(isColorAbsent) AS nColorAbsent,
+      COUNTIF(isAlgorithmNameMissing) AS nAlgorithmNameMissing,
+      COUNTIF(isAlgorithmUnidentified) AS nAlgorithmUnidentified,
       STRING_AGG(
         DISTINCT
         IF(isAnatomyConflict OR isLateralityInverted,
@@ -212,15 +319,27 @@ SELECT
   #   MALFORMED_SEGMENT        (Medium) 08_malformed_segment.sql
   #   RETIRED_CODING_SCHEME    (Medium) 13_retired_coding_scheme.sql
   #   TRACKINGUID_AMBIGUOUS    (Medium) 11_tracking_uid.sql
+  #   COLOR_DUPLICATE          (Medium) 14_recommended_color.sql
+  #   COLOR_NOT_PERMITTED      (Medium) 14_recommended_color.sql
+  #   COLOR_MALFORMED          (Medium) 14_recommended_color.sql
+  #   ALGORITHM_NAME_MISSING   (Medium) 15_algorithm_identification.sql
   #   COSMETIC_VARIANT         (Low)    02_ambiguous_code.sql
   #   CODE_MEANING_SPELLING    (Low)    05_anatomy_conflict.sql
   #   TYPE_REPEATS_CATEGORY    (Low)    09_type_repeats_category.sql
   #   NO_SEGMENTS_OVERLAP      (Low)    10_segments_overlap_absent.sql
-  # Issue 9's IOD_ERROR / IOD_WARNING are deliberately ABSENT here. They come
-  # from dciodvfy, which validates objects, not a metadata table, so they are
-  # only available on the local-files path - scripts/seg_checks.py --iod adds
-  # them there. A triage list built from this query is silent about IOD
-  # conformance; say so rather than letting the silence read as a pass.
+  #   COLOR_CONFUSABLE         (Low)    14_recommended_color.sql
+  #   COLOR_INCONSISTENT       (Low)    14_recommended_color.sql
+  #   COLOR_ABSENT             (Low)    14_recommended_color.sql
+  #   ALGORITHM_UNIDENTIFIED   (Low)    15_algorithm_identification.sql
+  # Four tags are deliberately ABSENT here, because the queries that would
+  # produce them cannot run on a metadata table:
+  #   IOD_ERROR / IOD_WARNING            issue 9, from dciodvfy
+  #   EMPTY_SEGMENT / EMPTY_FRAMES_RETAINED   issue 11, from the pixel data
+  #   UNCOMPRESSED / LOSSY_COMPRESSED    issue 12, from the file meta group
+  # All three checks need the objects. scripts/seg_checks.py adds them on the
+  # local-files path, via --iod and --encoding. A triage list built from this
+  # query is SILENT about IOD conformance and about how the objects are
+  # encoded; say so rather than letting the silence read as a pass.
   #
   #   CODE_AMBIGUOUS_ELSEWHERE (context) a code this series uses is used with
   #     another meaning by some OTHER series. No evidence this series is wrong,
@@ -238,10 +357,18 @@ SELECT
         IF(nMalformed > 0, 'MALFORMED_SEGMENT', NULL),
         IF(nRetiredScheme > 0, 'RETIRED_CODING_SCHEME', NULL),
         IF(nTrackingAmbiguous > 0, 'TRACKINGUID_AMBIGUOUS', NULL),
+        IF(nColorDuplicate > 0, 'COLOR_DUPLICATE', NULL),
+        IF(nColorNotPermitted > 0, 'COLOR_NOT_PERMITTED', NULL),
+        IF(nColorMalformed > 0, 'COLOR_MALFORMED', NULL),
+        IF(nAlgorithmNameMissing > 0, 'ALGORITHM_NAME_MISSING', NULL),
         IF(nCosmetic > 0, 'COSMETIC_VARIANT', NULL),
         IF(nSpellingVariant > 0, 'CODE_MEANING_SPELLING', NULL),
         IF(nTypeRepeatsCategory > 0, 'TYPE_REPEATS_CATEGORY', NULL),
         IF(anyNoSegmentsOverlap, 'NO_SEGMENTS_OVERLAP', NULL),
+        IF(nColorConfusable > 0, 'COLOR_CONFUSABLE', NULL),
+        IF(nColorInconsistent > 0, 'COLOR_INCONSISTENT', NULL),
+        IF(nColorAbsent > 0, 'COLOR_ABSENT', NULL),
+        IF(nAlgorithmUnidentified > 0, 'ALGORITHM_UNIDENTIFIED', NULL),
         IF(nCodeAmbiguousSomewhere > 0, 'CODE_AMBIGUOUS_ELSEWHERE', NULL)]) AS tag
       WHERE tag IS NOT NULL),
     '; ') AS issues,
@@ -255,9 +382,11 @@ SELECT
       OR nSelfInconsistent > 0 OR nMinorityMeaning > 0
       OR nTrackingCrossPatient > 0 THEN 'High'
     WHEN nLateralityUncoded > 0 OR nMalformed > 0 OR nTrackingAmbiguous > 0
-      OR nEntireFlavour > 0 THEN 'Medium'
+      OR nEntireFlavour > 0 OR nColorDuplicate > 0 OR nColorNotPermitted > 0
+      OR nColorMalformed > 0 OR nAlgorithmNameMissing > 0 THEN 'Medium'
     WHEN nCosmetic > 0 OR nSpellingVariant > 0 OR nTypeRepeatsCategory > 0
-      OR anyNoSegmentsOverlap THEN 'Low'
+      OR anyNoSegmentsOverlap OR nColorConfusable > 0 OR nColorInconsistent > 0
+      OR nColorAbsent > 0 OR nAlgorithmUnidentified > 0 THEN 'Low'
     ELSE 'None'
     END AS worstSeverity,
 

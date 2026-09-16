@@ -10,12 +10,14 @@ Usage:
   python seg_checks.py seg_attributes.csv --outdir findings/
   python seg_checks.py seg_attributes.csv --outdir findings/ \\
       --codes findings/codes.csv --review review.csv \\
-      --iod findings/issue9_iod_validation.csv
+      --iod findings/issue9_iod_validation.csv \\
+      --encoding findings/encoding_per_object.csv
 
-Computed checks (issues 2, 4, 5, 6, 7, 10) need nothing but the data and will
-follow a new delivery. Issue 8 needs the fully specified names from
+Computed checks (issues 2, 4, 5, 6, 7, 10, 13, 14) need nothing but the data
+and will follow a new delivery. Issue 8 needs the fully specified names from
 lookup_codes.py. Issue 9 is the IOD validator's verdict, read from
-dciodvfy_check.py via --iod; it needs the files, so it is unavailable on the
+dciodvfy_check.py via --iod, and issues 11 and 12 come from seg_encoding.py
+via --encoding; all three need the files, so they are unavailable on the
 BigQuery and DICOMweb paths. Issues 1 and 3 are curated: they need --review,
 and a review built against an earlier batch is STALE until re-derived. See
 SKILL.md, "Core rule".
@@ -28,6 +30,9 @@ from collections import Counter, defaultdict
 from difflib import SequenceMatcher
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import cielab  # noqa: E402  - same directory, stdlib only
+
 # Tag -> severity. CODE_AMBIGUOUS_ELSEWHERE is deliberately absent: it is a
 # property of a code across the whole population, not evidence about the series
 # carrying it, so it must not raise worstSeverity. See references/reporting.md.
@@ -37,17 +42,29 @@ SEVERITY = {
     "CODE_SELF_INCONSISTENT": "High",
     "CODE_MEANING_MINORITY": "High",
     "TRACKINGUID_CROSS_PATIENT": "High",
+    "LOSSY_COMPRESSED": "High",
     "ENTIRE_CODE_FLAVOUR": "Medium",
     "LATERALITY_UNCODED": "Medium",
     "MALFORMED_SEGMENT": "Medium",
     "RETIRED_CODING_SCHEME": "Medium",
     "IOD_ERROR": "Medium",
     "TRACKINGUID_AMBIGUOUS": "Medium",
+    "EMPTY_SEGMENT": "Medium",
+    "COLOR_DUPLICATE": "Medium",
+    "COLOR_NOT_PERMITTED": "Medium",
+    "COLOR_MALFORMED": "Medium",
+    "ALGORITHM_NAME_MISSING": "Medium",
     "COSMETIC_VARIANT": "Low",
     "IOD_WARNING": "Low",
     "CODE_MEANING_SPELLING": "Low",
     "TYPE_REPEATS_CATEGORY": "Low",
     "NO_SEGMENTS_OVERLAP": "Low",
+    "EMPTY_FRAMES_RETAINED": "Low",
+    "UNCOMPRESSED": "Low",
+    "COLOR_CONFUSABLE": "Low",
+    "COLOR_INCONSISTENT": "Low",
+    "COLOR_ABSENT": "Low",
+    "ALGORITHM_UNIDENTIFIED": "Low",
 }
 TAG_ORDER = list(SEVERITY) + ["CODE_AMBIGUOUS_ELSEWHERE"]
 RANK = {"High": 0, "Medium": 1, "Low": 2, "None": 3}
@@ -63,6 +80,23 @@ RETIRED_SCHEMES = {
     "SNM3": "SCT",
     "SNM": "SCT",
     "99SDM": "SCT",
+}
+
+# Issue 14. SegmentAlgorithmName (0062,0009) is Type 1C - "Required if Segment
+# Algorithm Type (0062,0008) is not MANUAL" (PS3.3 C.8.20.2) - so these two
+# values are what make it required.
+NON_MANUAL_ALGORITHM = {"AUTOMATIC", "SEMIAUTOMATIC"}
+
+# Names that satisfy the letter of 1C while identifying nothing. Matched on the
+# whole value, case-folded, after stripping punctuation: a name is a name, and
+# "unknown" is not one. Toolkit names are here because a converter's name says
+# what wrote the object, not what segmented it.
+UNINFORMATIVE_ALGORITHM_NAMES = {
+    "", "-", "n/a", "na", "none", "null", "nil", "unknown", "unspecified",
+    "not specified", "not applicable", "tbd", "todo", "test", "default",
+    "algorithm", "segmentation", "segment", "auto", "automatic", "manual",
+    "ai", "model", "dcmqi", "pydicom", "highdicom", "itk", "simpleitk",
+    "slicer", "3d slicer", "plastimatch", "dcmtk",
 }
 
 # The code sequences the per-segment table carries a designator for.
@@ -287,6 +321,330 @@ def retired_scheme(rows):
 
 
 # ---------------------------------------------------------------------------
+# Issue 13 - RecommendedDisplayCIELabValue. Computed, in Lab: no colour is
+# converted to RGB to decide anything, only to draw the preview.
+# ---------------------------------------------------------------------------
+
+
+def structure_key(row):
+    """What a viewer's user would call "a different thing" on screen.
+
+    The coded identity first, because that is what the object asserts; the
+    label only where there is no code at all. Two segments of the SAME
+    structure sharing a colour is not a finding - it is the point of a colour
+    convention - so this key is what separates the finding from the norm.
+    """
+    coded = (
+        row.get("SegmentedPropertyTypeCodingSchemeDesignator", ""),
+        row.get("SegmentedPropertyTypeCodeValue", ""),
+        row.get("AnatomicRegionCodingSchemeDesignator", ""),
+        row.get("AnatomicRegionCodeValue", ""),
+    )
+    if any(coded):
+        return coded
+    return ("", row.get("SegmentLabel", ""), "", "")
+
+
+def structure_label(row):
+    parts = [
+        row.get("SegmentedPropertyTypeCodeMeaning", ""),
+        row.get("AnatomicRegionCodeMeaning", ""),
+    ]
+    named = " / ".join(part for part in parts if part)
+    return named or row.get("SegmentLabel", "") or "(uncoded)"
+
+
+def recommended_color(rows, threshold=10.0):
+    """Which colours the batch assigns, and where two structures share one.
+
+    Returns (findings, palette). `findings` is one row per segment with a
+    problem, `palette` one row per distinct colour - the palette is the
+    deliverable that answers "what colours are assigned at all", and it is
+    worth publishing even when nothing is wrong.
+
+    Four things are decided here:
+
+      ABSENT           (0062,000D) is Type 3, so this is conformant. Reported
+                       because a consumer then has to invent a colour, and two
+                       consumers will invent different ones.
+      MALFORMED        present but not three unsigned shorts. A VM violation.
+      NOT_PERMITTED    PS3.3 C.8.20.2: the attribute "shall not be present if
+                       Segmentation Type is LABELMAP and Photometric
+                       Interpretation is PALETTE COLOR" - the palette already
+                       carries the colour, and two sources of truth is one too
+                       many.
+      DUPLICATE /      two segments of DIFFERENT structures, in ONE object,
+      CONFUSABLE       given the same colour or one within `threshold` dE*ab
+                       of it. This is the one a reader sees: the viewer draws
+                       both overlays identically and no amount of correct
+                       metadata tells them apart on screen.
+      INCONSISTENT     one structure drawn in several colours across the
+                       batch. Not wrong anywhere in particular; it makes two
+                       series unreadable side by side.
+    """
+    findings = []
+    # Keyed on the row's index, not the row: the row is a dict, so it is
+    # neither hashable nor safe to identify by value - two segments can be
+    # identical in every column this check reads.
+    parsed = {}
+    malformed = {}
+    for index, row in enumerate(rows):
+        try:
+            parsed[index] = cielab.parse(row.get("RecommendedDisplayCIELabValue", ""))
+        except ValueError as exc:
+            parsed[index] = None
+            malformed[index] = str(exc)
+
+    def finding(index, issue, **extra):
+        row = rows[index]
+        entry = key(row)
+        entry.update({
+            "SOPInstanceUID": row["SOPInstanceUID"],
+            "colorIssue": issue,
+            "RecommendedDisplayCIELabValue": row.get(
+                "RecommendedDisplayCIELabValue", ""),
+            "hex": "",
+            "structure": structure_label(row),
+            "SegmentationType": row.get("SegmentationType", ""),
+            "PhotometricInterpretation": row.get("PhotometricInterpretation", ""),
+            "collidesWithSegments": "",
+            "collidesWithStructures": "",
+            "deltaE": "",
+            "SeriesDescription": row.get("SeriesDescription", ""),
+        })
+        triplet = parsed.get(index)
+        if triplet:
+            entry["hex"] = cielab.to_hex(triplet)
+        entry.update(extra)
+        return entry
+
+    for index, message in malformed.items():
+        findings.append(finding(index, "MALFORMED", collidesWithStructures=message))
+
+    for index, row in enumerate(rows):
+        if parsed[index] is None:
+            if index not in malformed:
+                findings.append(finding(index, "ABSENT"))
+        elif (
+            row.get("SegmentationType", "") == "LABELMAP"
+            and row.get("PhotometricInterpretation", "") == "PALETTE COLOR"
+        ):
+            findings.append(finding(index, "NOT_PERMITTED"))
+
+    # Within one object: who cannot be told apart from whom.
+    objects = defaultdict(list)
+    for index, row in enumerate(rows):
+        if parsed[index] is not None:
+            objects[row["SOPInstanceUID"]].append(index)
+
+    shared_colours = set()
+    for group in objects.values():
+        collisions = defaultdict(list)
+        for position, first in enumerate(group):
+            for second in group[position + 1:]:
+                if structure_key(rows[first]) == structure_key(rows[second]):
+                    continue
+                distance = cielab.delta_e(parsed[first], parsed[second])
+                if parsed[first] == parsed[second]:
+                    verdict = "DUPLICATE_IN_OBJECT"
+                elif distance < threshold:
+                    verdict = "CONFUSABLE_IN_OBJECT"
+                else:
+                    continue
+                shared_colours.add(parsed[first])
+                shared_colours.add(parsed[second])
+                collisions[first].append((verdict, second, distance))
+                collisions[second].append((verdict, first, distance))
+        for index in group:
+            entries = collisions.get(index)
+            if not entries:
+                continue
+            # One row per segment, not one per pair: the segment is what gets
+            # recoloured, and a three-way collision is one job, not three.
+            verdict = (
+                "DUPLICATE_IN_OBJECT"
+                if any(v == "DUPLICATE_IN_OBJECT" for v, _, _ in entries)
+                else "CONFUSABLE_IN_OBJECT"
+            )
+            findings.append(finding(
+                index, verdict,
+                collidesWithSegments=";".join(
+                    str(rows[other]["SegmentNumber"]) for _, other, _ in entries),
+                collidesWithStructures="; ".join(
+                    sorted({structure_label(rows[other])
+                            for _, other, _ in entries})),
+                deltaE=round(min(distance for _, _, distance in entries), 2),
+            ))
+
+    # Across the batch: one structure, several colours.
+    per_structure = defaultdict(set)
+    for index, row in enumerate(rows):
+        if parsed[index] is not None:
+            per_structure[structure_key(row)].add(parsed[index])
+    inconsistent = {k for k, colours in per_structure.items() if len(colours) > 1}
+    for index, row in enumerate(rows):
+        if parsed[index] is not None and structure_key(row) in inconsistent:
+            findings.append(finding(
+                index, "INCONSISTENT_ACROSS_BATCH",
+                collidesWithStructures="; ".join(sorted(
+                    cielab.to_hex(t) for t in per_structure[structure_key(row)])),
+            ))
+
+    # The palette: one row per distinct colour, most used first.
+    per_colour = defaultdict(lambda: {"rows": [], "structures": {}})
+    for index, row in enumerate(rows):
+        triplet = parsed[index]
+        if triplet is None:
+            continue
+        entry = per_colour[triplet]
+        entry["rows"].append(row)
+        entry["structures"][structure_key(row)] = structure_label(row)
+
+    palette = []
+    for triplet, entry in per_colour.items():
+        lightness, a_star, b_star = cielab.to_lab(triplet)
+        group = entry["rows"]
+        palette.append({
+            "RecommendedDisplayCIELabValue": "/".join(str(v) for v in triplet),
+            "hex": cielab.to_hex(triplet),
+            "Lstar": round(lightness, 1),
+            "astar": round(a_star, 1),
+            "bstar": round(b_star, 1),
+            "segments": len(group),
+            "series": len({r["SeriesInstanceUID"] for r in group}),
+            "objects": len({r["SOPInstanceUID"] for r in group}),
+            "distinctStructures": len(entry["structures"]),
+            "structures": "; ".join(sorted(entry["structures"].values())[:6]),
+            "sharedWithinObject": str(triplet in shared_colours),
+            "exampleSeriesInstanceUID": group[0]["SeriesInstanceUID"],
+            "viewer_url": group[0]["viewer_url"],
+        })
+    palette.sort(key=lambda r: (-r["segments"], r["hex"]))
+    return findings, palette
+
+
+def write_palette_markdown(outdir, palette, swatch_dir="swatches"):
+    """The palette as a paste-ready Markdown table, with a visible swatch.
+
+    A colour finding that a reader cannot SEE is half a finding, and no
+    Markdown renderer agrees on how to show one. GitHub strips `style`, so an
+    inline-styled cell renders as bare text; it refuses `data:` image sources,
+    so an embedded PNG renders as a broken image; its `#rrggbb` chip syntax
+    works in issues and pull requests but not in a committed .md file.
+
+    What survives all of them is a small SVG file referenced relatively, so
+    that is what this writes - one file per distinct colour, beside the report.
+    The hex is printed in the same row regardless, because a swatch that fails
+    to load must still leave the reader with the value.
+
+    Returns (markdown path, swatch directory). Keep them together when the
+    report moves: the <img> paths are relative to the Markdown file.
+    """
+    outdir = Path(outdir)
+    swatches = outdir / swatch_dir
+    swatches.mkdir(parents=True, exist_ok=True)
+
+    lines = [
+        "| Colour | Hex | L\\*a\\*b\\* | Segments | Series | Structures |",
+        "|---|---|---|---|---|---|",
+    ]
+    for entry in palette:
+        name = entry["hex"].lstrip("#")
+        triplet = cielab.parse(entry["RecommendedDisplayCIELabValue"])
+        (swatches / f"{name}.svg").write_text(cielab.swatch_svg(triplet))
+        shared = " **shared**" if entry["sharedWithinObject"] == "True" else ""
+        lines.append(
+            f'| <img src="{swatch_dir}/{name}.svg" width="16" height="16" '
+            f'alt="{entry["hex"]}"> | `{entry["hex"]}`{shared} | '
+            f'{entry["Lstar"]} / {entry["astar"]} / {entry["bstar"]} | '
+            f'{entry["segments"]} | {entry["series"]} | {entry["structures"]} |'
+        )
+    lines.append("")
+    lines.append(
+        "Swatches are sRGB renderings of the stored CIELab, assuming the D50 "
+        "white point of the ICC PCS (PS3.3 C.10.7.1.1). Writers differ at the "
+        "margins, so read a swatch as the producer's intent, not as evidence - "
+        "every finding above is decided in CIELab itself."
+    )
+    path = outdir / "issue13_color_palette.md"
+    path.write_text("\n".join(lines) + "\n")
+    return path, swatches
+
+
+# ---------------------------------------------------------------------------
+# Issue 14 - an automatic segmentation that does not say what made it.
+# Computed.
+# ---------------------------------------------------------------------------
+
+
+def _uninformative(name):
+    stripped = "".join(
+        character for character in name.lower() if character.isalnum() or character == " "
+    ).strip()
+    return stripped in UNINFORMATIVE_ALGORITHM_NAMES
+
+
+def algorithm_identification(rows):
+    """Segments whose SegmentAlgorithmType is not MANUAL but which do not
+    identify the algorithm that produced them.
+
+    One row per affected segment, listing every reason, because they are one
+    fix at the producer rather than one per segment.
+
+      NAME_MISSING      SegmentAlgorithmName (0062,0009) absent. Type 1C -
+                        "Required if Segment Algorithm Type (0062,0008) is not
+                        MANUAL" - so this is a conformance violation, and the
+                        only one of the four that is.
+      NAME_UNINFORMATIVE  a name that identifies nothing: "unknown", "AI", or
+                        the name of the toolkit that WROTE the object rather
+                        than the model that segmented it.
+      NO_IDENTIFICATION  no Segmentation Algorithm Identification Sequence
+                        (0062,0007). Type 3, so conformant - and the only
+                        standard home for the version, the source and a code
+                        for the specific algorithm. Without it the delivery
+                        cannot be attributed to a model at all.
+      NO_VERSION        the sequence is present but Algorithm Version
+                        (0066,0031), Type 1 within it, is empty.
+    """
+    findings = []
+    for row in rows:
+        algorithm_type = (row.get("SegmentAlgorithmType", "") or "").strip().upper()
+        if algorithm_type not in NON_MANUAL_ALGORITHM:
+            continue
+        name = (row.get("SegmentAlgorithmName", "") or "").strip()
+        issues = []
+        if not name:
+            issues.append("NAME_MISSING")
+        elif _uninformative(name):
+            issues.append("NAME_UNINFORMATIVE")
+        if row.get("hasAlgorithmIdentification", "") != "True":
+            issues.append("NO_IDENTIFICATION")
+        elif not (row.get("AlgorithmVersion", "") or "").strip():
+            issues.append("NO_VERSION")
+        if not issues:
+            continue
+        entry = key(row)
+        entry.update({
+            "SOPInstanceUID": row["SOPInstanceUID"],
+            "SegmentAlgorithmType": algorithm_type,
+            "algorithmIssues": "; ".join(issues),
+            "SegmentAlgorithmName": name,
+            "AlgorithmName": row.get("AlgorithmName", ""),
+            "AlgorithmVersion": row.get("AlgorithmVersion", ""),
+            "AlgorithmSource": row.get("AlgorithmSource", ""),
+            "AlgorithmNameCodeMeaning": row.get("AlgorithmNameCodeMeaning", ""),
+            # The object-level identification, which is NOT a substitute: it
+            # names the software that wrote the file, which on a converted
+            # segmentation is the converter.
+            "ManufacturerModelName": row.get("ManufacturerModelName", ""),
+            "SoftwareVersion": row.get("SoftwareVersion", ""),
+            "SeriesDescription": row.get("SeriesDescription", ""),
+        })
+        findings.append(entry)
+    return findings
+
+
+# ---------------------------------------------------------------------------
 # Issue 9 - IOD conformance, from dciodvfy. Read, not computed here: the
 # validator needs the files, which the BigQuery and DICOMweb paths do not have.
 # ---------------------------------------------------------------------------
@@ -306,6 +664,34 @@ def iod_tags(path):
             continue
         tag = "IOD_ERROR" if row["dciodvfySeverity"] == "Error" else "IOD_WARNING"
         tags[row["SeriesInstanceUID"]][tag] += 1
+    return tags
+
+
+def encoding_tags(path):
+    """encoding_per_object.csv -> SeriesInstanceUID -> {tag: count of objects}.
+
+    Issues 11 and 12, read the same way issue 9 is: seg_encoding.py needs the
+    objects, so on the BigQuery and DICOMweb paths these tags are absent and
+    the triage list is SILENT about them rather than clearing them.
+
+    LOSSY_COMPRESSED is taken from the transfer syntax alone, never from
+    LossyImageCompression (0028,2110). PS3.3 C.8.20.2.2 requires that Attribute
+    to be "01" when any of the SOURCE images was lossy compressed, so on a
+    segmentation of a lossy-compressed CT it is "01" while the segmentation
+    itself is intact. Reading it as "this object was lossy compressed" would
+    manufacture a High finding out of a correctly encoded object.
+    """
+    tags = defaultdict(Counter)
+    for row in load(path):
+        series = row["SeriesInstanceUID"]
+        if row.get("isLossy", "") == "True":
+            tags[series]["LOSSY_COMPRESSED"] += 1
+        elif row.get("isCompressed", "") == "False":
+            tags[series]["UNCOMPRESSED"] += 1
+        if int(row.get("emptyFrames") or 0):
+            tags[series]["EMPTY_FRAMES_RETAINED"] += 1
+        if int(row.get("emptySegmentCount") or 0):
+            tags[series]["EMPTY_SEGMENT"] += 1
     return tags
 
 
@@ -502,7 +888,7 @@ def curated(rows, review_csv):
 
 
 def triage(rows, ambiguous, cosmetic, entire, verdicts, tracking,
-           iod=None):
+           iod=None, colors=None, algorithms=None, encoding=None):
     ambiguous_tracking = {
         f["TrackingUID"] for f in tracking if f["sharingPattern"] == "WITHIN_STUDY"
     }
@@ -524,6 +910,31 @@ def triage(rows, ambiguous, cosmetic, entire, verdicts, tracking,
         for series, codes in per_series.items()
         if any(len(m) > 1 for m in codes.values())
     }
+
+    # Issues 13 and 14 are decided per segment by their own checks, so the
+    # roll-up reads their verdicts rather than recomputing them - there is one
+    # definition of each tag, in one place.
+    colour_tags = {
+        "DUPLICATE_IN_OBJECT": "COLOR_DUPLICATE",
+        "CONFUSABLE_IN_OBJECT": "COLOR_CONFUSABLE",
+        "INCONSISTENT_ACROSS_BATCH": "COLOR_INCONSISTENT",
+        "NOT_PERMITTED": "COLOR_NOT_PERMITTED",
+        "MALFORMED": "COLOR_MALFORMED",
+        "ABSENT": "COLOR_ABSENT",
+    }
+    per_segment = defaultdict(Counter)
+    for entry in colors or []:
+        tag = colour_tags.get(entry["colorIssue"])
+        if tag:
+            per_segment[(entry["SOPInstanceUID"], entry["SegmentNumber"])][tag] += 1
+    for entry in algorithms or []:
+        issues = entry["algorithmIssues"].split("; ")
+        tag = (
+            "ALGORITHM_NAME_MISSING"
+            if "NAME_MISSING" in issues
+            else "ALGORITHM_UNIDENTIFIED"
+        )
+        per_segment[(entry["SOPInstanceUID"], entry["SegmentNumber"])][tag] += 1
 
     series_rows = defaultdict(list)
     for row in rows:
@@ -579,9 +990,16 @@ def triage(rows, ambiguous, cosmetic, entire, verdicts, tracking,
                 counts["TYPE_REPEATS_CATEGORY"] += 1
             if not row["SegmentsOverlap"]:
                 counts["NO_SEGMENTS_OVERLAP"] += 1
+            for tag, count in per_segment.get(
+                (row["SOPInstanceUID"], row["SegmentNumber"]), {}
+            ).items():
+                counts[tag] += count
 
-        # Issue 9 is per OBJECT, not per segment, so it joins at the series.
+        # Issues 9, 11 and 12 are per OBJECT, not per segment, so they join at
+        # the series.
         for tag, count in (iod or {}).get(series, {}).items():
+            counts[tag] += count
+        for tag, count in (encoding or {}).get(series, {}).items():
             counts[tag] += count
 
         tags = [t for t in TAG_ORDER if counts[t]]
@@ -638,6 +1056,23 @@ def main():
         help="issue9_iod_validation.csv from dciodvfy_check.py; folds the IOD "
         "validator's verdict into the triage list. Local files only - the "
         "validator needs the objects, not a metadata table.",
+    )
+    parser.add_argument(
+        "--encoding",
+        help="encoding_per_object.csv from seg_encoding.py; folds issues 11 "
+        "and 12 (empty frames, compression) into the triage list. Local files "
+        "only - both need the objects, not a metadata table.",
+    )
+    parser.add_argument(
+        "--color-delta-e",
+        type=float,
+        default=10.0,
+        metavar="DE",
+        help="issue 13: how close two colours in ONE object must be before a "
+        "reader cannot tell the segments apart, in dE*ab (default 10). 2.3 is "
+        "the just-noticeable difference for two large flat patches; segment "
+        "overlays are small, scattered and drawn over grey, so the useful "
+        "threshold is well above that.",
     )
     parser.add_argument(
         "--include-background",
@@ -733,6 +1168,68 @@ def main():
     else:
         print("Issue 10 retired scheme        0 segments  ok: no SRT/SNM3 codes")
 
+    colors, palette = recommended_color(rows, args.color_delta_e)
+    write(outdir, "issue13_recommended_color.csv", colors,
+          ["PatientID", "StudyInstanceUID", "SeriesInstanceUID", "SOPInstanceUID",
+           "SegmentNumber", "SegmentLabel", "colorIssue",
+           "RecommendedDisplayCIELabValue", "hex", "structure",
+           "collidesWithSegments", "collidesWithStructures", "deltaE",
+           "SegmentationType", "PhotometricInterpretation", "SeriesDescription",
+           "viewer_url"])
+    write(outdir, "issue13_color_palette.csv", palette,
+          ["RecommendedDisplayCIELabValue", "hex", "Lstar", "astar", "bstar",
+           "segments", "series", "objects", "distinctStructures", "structures",
+           "sharedWithinObject", "exampleSeriesInstanceUID", "viewer_url"])
+    colour_counts = Counter(f["colorIssue"] for f in colors)
+    coloured = sum(1 for r in rows if r.get("RecommendedDisplayCIELabValue"))
+    print(f"Issue 13 display colour   {len(palette):>6} distinct colours over "
+          f"{coloured} of {len(rows)} segments")
+    for name, label in (
+        ("DUPLICATE_IN_OBJECT", "two structures, one colour, one object"),
+        ("CONFUSABLE_IN_OBJECT", f"within {args.color_delta_e:g} dE*ab in one object"),
+        ("INCONSISTENT_ACROSS_BATCH", "one structure, several colours"),
+        ("NOT_PERMITTED", "LABELMAP + PALETTE COLOR: shall not be present"),
+        ("MALFORMED", "not three unsigned shorts"),
+        ("ABSENT", "no colour at all (Type 3, so conformant)"),
+    ):
+        if colour_counts[name]:
+            print(f"           {name:<26} {colour_counts[name]:>6}  {label}")
+    if palette:
+        markdown, swatches = write_palette_markdown(outdir, palette)
+        print(f"           palette -> {markdown} ({len(palette)} swatches in "
+              f"{swatches}/) - paste the table into the report")
+
+    algorithms = algorithm_identification(rows)
+    write(outdir, "issue14_algorithm_identification.csv", algorithms,
+          ["PatientID", "StudyInstanceUID", "SeriesInstanceUID", "SOPInstanceUID",
+           "SegmentNumber", "SegmentLabel", "SegmentAlgorithmType",
+           "algorithmIssues", "SegmentAlgorithmName", "AlgorithmName",
+           "AlgorithmVersion", "AlgorithmSource", "AlgorithmNameCodeMeaning",
+           "ManufacturerModelName", "SoftwareVersion", "SeriesDescription",
+           "viewer_url"])
+    automatic = [
+        r for r in rows
+        if (r.get("SegmentAlgorithmType", "") or "").strip().upper()
+        in NON_MANUAL_ALGORITHM
+    ]
+    algorithm_counts = Counter(
+        issue for f in algorithms for issue in f["algorithmIssues"].split("; ")
+    )
+    if automatic:
+        print(f"Issue 14 algorithm id     {len(algorithms):>6} of {len(automatic)} "
+              "AUTOMATIC/SEMIAUTOMATIC segments do not identify what made them")
+        for name, label in (
+            ("NAME_MISSING", "SegmentAlgorithmName absent - Type 1C violation"),
+            ("NAME_UNINFORMATIVE", "a name that identifies nothing"),
+            ("NO_IDENTIFICATION", "no (0062,0007), so no version and no model code"),
+            ("NO_VERSION", "(0062,0007) present, AlgorithmVersion empty"),
+        ):
+            if algorithm_counts[name]:
+                print(f"           {name:<26} {algorithm_counts[name]:>6}  {label}")
+    else:
+        print("Issue 14 algorithm id          - no AUTOMATIC or SEMIAUTOMATIC "
+              "segments; nothing is required")
+
     # ---- read from the IOD validator, if it was run
     iod = None
     if args.iod:
@@ -744,6 +1241,22 @@ def main():
               f"({args.iod})")
     else:
         print("Issue 9  skipped - run dciodvfy_check.py and pass --iod "
+              "(local files only)")
+
+    # ---- read from the encoding scan, if it was run
+    encoding = None
+    if args.encoding:
+        encoding = encoding_tags(args.encoding)
+        objects = load(args.encoding)
+        empty = [o for o in objects if int(o.get("emptyFrames") or 0)]
+        lossy = [o for o in objects if o.get("isLossy") == "True"]
+        uncompressed = [o for o in objects if o.get("isCompressed") == "False"]
+        print(f"Issue 11 empty frames     {len(empty):>6} of {len(objects)} objects "
+              "keep at least one all-zero frame")
+        print(f"Issue 12 compression      {len(uncompressed):>6} of {len(objects)} "
+              f"objects are uncompressed, {len(lossy)} LOSSY compressed")
+    else:
+        print("Issues 11, 12 skipped - run seg_encoding.py and pass --encoding "
               "(local files only)")
 
     # ---- needs the FSN lookup
@@ -784,7 +1297,8 @@ def main():
               "(see references/terminology.md)")
 
     # ---- roll-up
-    series = triage(rows, ambiguous, cosmetic, entire, verdicts, track, iod)
+    series = triage(rows, ambiguous, cosmetic, entire, verdicts, track, iod,
+                    colors, algorithms, encoding)
     path = write(outdir, "series_triage.csv", series,
                  ["PatientID", "StudyInstanceUID", "SeriesInstanceUID", "issues",
                   "worstSeverity", "segmentCount", "segmentsNeedingRecode",
